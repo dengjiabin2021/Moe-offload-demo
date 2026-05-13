@@ -57,6 +57,7 @@ def load_tensor_by_name(
     # 在函数内部导入 torch，这样 --help 或静态检查不需要提前加载 torch。
     try:
         import torch
+        import mmap  # 新增：内存映射模块（Python内置，无需安装）
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError("加载权重需要安装 PyTorch，请先执行：pip install torch") from exc
 
@@ -83,20 +84,18 @@ def load_tensor_by_name(
 
     validate_tensor_size(dtype_name=dtype_name, shape=shape, nbytes=nbytes, tensor_name=tensor_name)
 
-    with shard_path.open("rb") as handle:
-        # 移动到该 tensor 的文件内绝对偏移。
-        handle.seek(offset)
+    element_size = torch.empty((), dtype=torch_dtype).element_size()
 
-        # 精确读取该 tensor 占用的字节数。
-        raw_bytes = handle.read(nbytes)
-
-    if len(raw_bytes) != nbytes:
-        raise ValueError(
-            f"Read {len(raw_bytes)} bytes for {tensor_name}, but manifest expects {nbytes} bytes."
-        )
-
-    # torch.frombuffer 会把 bytes 直接解释成一维 tensor；clone() 让 tensor 拥有独立可写内存。
-    tensor = torch.frombuffer(raw_bytes, dtype=torch_dtype)
+    with open(shard_path, "rb") as f:
+        # 内存映射文件（不加载数据到内存，仅建立虚拟地址映射）
+        with mmap.mmap(f.fileno(), length=0, access=mmap.ACCESS_READ) as mm:
+            # 直接从映射内存创建张量：零拷贝，无警告，无冗余内存
+            tensor = torch.frombuffer(
+                mm,
+                dtype=torch_dtype,
+                offset=offset,
+                count=nbytes // element_size
+            ).clone()  # clone后获得独立内存，退出with块自动释放mmap映射
 
     # 按 manifest 记录的 shape 还原 tensor 形状。
     tensor = tensor.reshape(shape)
@@ -174,16 +173,16 @@ def parse_args() -> argparse.Namespace:
 
     # 模型目录中需要包含 weight_manifest.json 和对应的 safetensors 分片。
     parser.add_argument(
-        "--model-dir",
-        default="models/Qwen1.5-Moe-A2.7B",
-        help="模型目录，默认读取 models/Qwen1.5-Moe-A2.7B。",
+        "--model_dir",
+        default=None,
+        help="模型目录",
     )
 
     # manifest 路径可选；不传时默认使用模型目录下的 weight_manifest.json。
     parser.add_argument(
         "--manifest",
         default=None,
-        help="manifest JSON 路径，默认使用 <model-dir>/weight_manifest.json。",
+        help="manifest JSON 路径。",
     )
 
     # 默认先读到 CPU；后续如果要直接放 GPU，可以传 --device cuda。
@@ -210,7 +209,7 @@ def main() -> None:
     args = parse_args()
 
     # 统一把模型目录解析成绝对路径，后续拼接分片文件更稳。
-    model_dir = Path(args.model_dir).resolve()
+    model_dir = Path(args.model_dir).resolve() if args.model_dir else Path("./models/Qwen1.5-Moe-A2.7B").resolve()
 
     # 如果用户传了 manifest 路径，就使用用户路径；否则默认使用模型目录下的 weight_manifest.json。
     manifest_path = Path(args.manifest).resolve() if args.manifest else model_dir / "weight_manifest.json"

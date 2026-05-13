@@ -17,64 +17,6 @@ from typing import Any
 # 真正的 tensor 二进制数据紧跟在这段 JSON header 后面。
 SAFETENSORS_HEADER_LEN_BYTES = 8
 
-
-def parse_args() -> argparse.Namespace:
-    """解析命令行参数。"""
-
-    # 这里的脚本只负责生成索引文件，不读取 tensor 内容，所以不需要 torch/safetensors 依赖。
-    parser = argparse.ArgumentParser(
-        description=(
-            "读取本地 safetensors 分片的 header，生成每个权重的文件名、"
-            "文件内偏移、字节数、dtype 和 shape。"
-        )
-    )
-
-    # 模型目录：里面应该包含 model-00001-of-00008.safetensors 这类分片文件。
-    parser.add_argument(
-        "--model-dir",
-        default="models/Qwen1.5-Moe-A2.7B",
-        help="包含 .safetensors 分片的模型目录。",
-    )
-
-    # 输出路径：不传时默认写到模型目录下，方便和权重文件放在一起管理。
-    parser.add_argument(
-        "--output",
-        default=None,
-        help="输出 JSON 路径，默认写到 <model-dir>/weight_manifest.json。",
-    )
-
-    # 返回 argparse.Namespace，后续通过 args.model_dir / args.output 访问。
-    return parser.parse_args()
-
-
-def main() -> None:
-    """脚本入口：解析参数、构建 manifest、写入 JSON 文件。"""
-
-    # 读取用户传入的命令行参数。
-    args = parse_args()
-
-    # resolve() 会把相对路径转换成绝对路径，便于后续检查目录是否存在。
-    model_dir = Path(args.model_dir).resolve()
-
-    # 如果用户指定了 --output，就用用户给的路径；否则写到模型目录下的 weight_manifest.json。
-    output_path = Path(args.output).resolve() if args.output else model_dir / "weight_manifest.json"
-
-    # 扫描所有 safetensors 分片，生成 {权重名: 位置信息} 的字典。
-    manifest = build_manifest(model_dir)
-
-    # 确保输出文件所在目录存在；如果目录已经存在，不会报错。
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # 使用 UTF-8 写 JSON，indent=2 让不同字段换行，方便人工检查和 git diff。
-    with output_path.open("w", encoding="utf-8") as handle:
-        json.dump(manifest, handle, ensure_ascii=False, indent=2)
-
-        # 末尾补一个换行，符合常见文本文件规范。
-        handle.write("\n")
-
-    print(f"Wrote {len(manifest)} tensor entries to {output_path}")
-
-
 def build_manifest(model_dir: Path) -> dict[str, dict[str, Any]]:
     """遍历模型目录下的所有 safetensors 分片，合并成完整权重 manifest。"""
 
@@ -177,6 +119,63 @@ def read_safetensors_header(model_dir: Path, shard_path: Path) -> dict[str, dict
 
     # 返回当前分片内所有 tensor 的位置信息。
     return entries
+
+
+def parse_args() -> argparse.Namespace:
+    """解析命令行参数。"""
+
+    # 这里的脚本只负责生成索引文件，不读取 tensor 内容，所以不需要 torch/safetensors 依赖。
+    parser = argparse.ArgumentParser(
+        description=(
+            "读取本地 safetensors 分片的 header，生成每个权重的文件名、"
+            "文件内偏移、字节数、dtype 和 shape。"
+        )
+    )
+
+    # 模型目录：里面应该包含 model-00001-of-00008.safetensors 这类分片文件。
+    parser.add_argument(
+        "model_dir",
+        default=None,
+        help="包含 .safetensors 分片的模型目录。",
+    )
+
+    # 输出路径：不传时默认写到模型目录下，方便和权重文件放在一起管理。
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="输出 JSON 路径，默认写到 <model_dir>/weight_manifest.json。",
+    )
+
+    # 返回 argparse.Namespace，后续通过 args.model_dir / args.output 访问。
+    return parser.parse_args()
+
+
+def main() -> None:
+    """脚本入口：解析参数、构建 manifest、写入 JSON 文件。"""
+
+    # 读取用户传入的命令行参数。
+    args = parse_args()
+
+    # resolve() 会把相对路径转换成绝对路径，便于后续检查目录是否存在。
+    model_dir = Path(args.model_dir).resolve()
+
+    # 如果用户指定了 --output，就用用户给的路径；否则写到模型目录下的 weight_manifest.json。
+    output_path = Path(args.output).resolve() if args.output else model_dir / "weight_manifest.json"
+
+    # 扫描所有 safetensors 分片，生成 {权重名: 位置信息} 的字典。
+    manifest = build_manifest(model_dir)
+
+    # 确保输出文件所在目录存在；如果目录已经存在，不会报错。
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 使用 UTF-8 写 JSON，indent=2 让不同字段换行，方便人工检查和 git diff。
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, ensure_ascii=False, indent=2)
+
+        # 末尾补一个换行，符合常见文本文件规范。
+        handle.write("\n")
+
+    print(f"Wrote {len(manifest)} tensor entries to {output_path}")
 
 
 # 只有直接运行本文件时才执行 main()；被其他模块 import 时不会自动生成 manifest。
