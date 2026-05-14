@@ -1,5 +1,13 @@
-"""MoE 专家按需加载 demo runtime。"""
+"""MoE runtime 对外入口。"""
 
-from .qwen2_moe_ondemand import load_qwen2_moe_with_ondemand_experts
+from .adapters import Qwen15MoeA27BAdapter, load_qwen15_moe_a27b_model
+from .core import MoeLoadReport, MoeModelAdapter, ResidentWeightLoader, get_parameter_device_stats
 
-__all__ = ["load_qwen2_moe_with_ondemand_experts"]
+__all__ = [
+    "MoeLoadReport",
+    "MoeModelAdapter",
+    "Qwen15MoeA27BAdapter",
+    "ResidentWeightLoader",
+    "get_parameter_device_stats",
+    "load_qwen15_moe_a27b_model",
+]
