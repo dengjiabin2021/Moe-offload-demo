@@ -17,7 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from moe_runtime.Loader import ManifestTensorLoader
+from moe_runtime.loader import ManifestTensorLoader
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     # 默认只打印 tensor 元信息，不打印值，避免误把大权重刷满终端。
     parser.add_argument(
         "--print-values",
-        action="store_true",
+        default = True,
         help="打印 tensor 内容。大 tensor 不建议开启。",
     )
 
@@ -80,10 +80,10 @@ def main() -> None:
 
     # 通过 tensor_name 从 manifest 定位、读取并还原成 torch.Tensor。
 
-    tensorloader = ManifestTensorLoader(model_dir = model_dir, manifest_path = manifest_path, device=device)
+    tensorloader = ManifestTensorLoader(model_dir = model_dir, manifest_path = manifest_path)
 
     tensor_name = args.tensor_name if args.tensor_name else "lm_head.weight"
-    tensor = tensorloader.load_tensor_by_name(tensor_name=tensor_name)
+    tensor = tensorloader.load_tensor_by_name(tensor_name=tensor_name, device=device)
 
     # ===================== 新增/优化打印 =====================
     print(f"✅ 成功加载张量: {tensor_name}")

@@ -50,16 +50,13 @@ class ManifestTensorLoader:
     """基于 weight_manifest.json，通过 tensor_name 精确读取单个 tensor。"""
     def __init__(self, *, 
                  model_dir: str | Path, 
-                 manifest_path: str | Path, 
-                 device: str | torch.device) -> None:
+                 manifest_path: str | Path) -> None:
 
         self.model_dir = Path(model_dir)
         self.manifest_path = Path(manifest_path)
-        self.device = torch.device(device)
         self._manifest: Dict[str, Dict[str, Any]] | None = None
 
-    
-    def load_tensor_by_name(self, *, tensor_name: str) -> torch.Tensor:
+    def load_tensor_by_name(self, *, tensor_name: str, device: str) -> torch.Tensor:
         """根据 tensor_name 从 safetensors 分片中读取一个 torch.Tensor。"""
 
         if self._manifest is None:
@@ -104,7 +101,7 @@ class ManifestTensorLoader:
         tensor = tensor.reshape(shape)
 
         # 如果用户指定 cuda 等设备，这里再把 tensor 移动过去。
-        return tensor.to(self.device)
+        return tensor.to(device)
 
     def _load_manifest_json(self) -> None:
 

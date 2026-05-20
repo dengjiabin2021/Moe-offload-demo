@@ -1,13 +1,17 @@
-"""MoE runtime 对外入口。"""
+"""MoE runtime 顶层导出。"""
 
-from .adapters import Qwen15MoeA27BAdapter, load_qwen15_moe_a27b_model
-from .core import MoeLoadReport, MoeModelAdapter, ResidentWeightLoader, get_parameter_device_stats
+from .adapters import (
+    MoeModelAdapter,
+    Qwen15MoeAdapter,
+    auto_select_adapter,
+)
+from .config import RuntimeConfig
+from .runtime_engine import MoeRuntimeEngine
 
 __all__ = [
-    "MoeLoadReport",
     "MoeModelAdapter",
-    "Qwen15MoeA27BAdapter",
-    "ResidentWeightLoader",
-    "get_parameter_device_stats",
-    "load_qwen15_moe_a27b_model",
+    "MoeRuntimeEngine",
+    "Qwen15MoeAdapter",
+    "RuntimeConfig",
+    "auto_select_adapter",
 ]
