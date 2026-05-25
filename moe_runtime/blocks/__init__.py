@@ -1,5 +1,5 @@
 """MoE runtime blocks。"""
 
-from .qwen_on_demand_moe_block import QwenOnDemandMoeBlock
+from .qwen2_moe_block import Qwen2OnDemandExperts
 
-__all__ = ["QwenOnDemandMoeBlock"]
+__all__ = ["Qwen2OnDemandExperts"]

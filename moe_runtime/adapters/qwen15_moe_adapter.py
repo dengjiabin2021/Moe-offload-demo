@@ -19,6 +19,7 @@ from transformers.models.qwen2_moe.configuration_qwen2_moe import Qwen2MoeConfig
 
 # 引入 Adapter 基类和结构化返回类型。
 from .base import ExpertWeightSpec, MoeModelAdapter
+from moe_runtime.blocks.qwen2_moe_block import Qwen2OnDemandExperts
 
 
 class Qwen15MoeAdapter(MoeModelAdapter):
@@ -75,6 +76,33 @@ class Qwen15MoeAdapter(MoeModelAdapter):
             },
         )
     
-    def patch_moe_block(self, model: nn.Module) -> nn.Module:
-        """将原始 MoE block替换"""
+    def patch_moe_block(
+        self,
+        model: nn.Module,
+        model_config: Qwen2MoeConfig,
+        cache_manager: Any | None = None,
+        prefetcher: Any | None = None,
+    ) -> nn.Module:
+        """只替换 Qwen sparse MoE block 内部的 routed experts。"""
+
+        # Qwen2MoeForCausalLM 的 decoder layers 通常位于 model.model.layers。
+        layers = model.model.layers
+
+        # 遍历每一层 decoder layer，只处理包含 sparse MoE experts 的层。
+        for layer_idx, layer in enumerate(layers):
+            mlp = getattr(layer, "mlp", None)
+
+            # 普通 dense MLP 没有 experts 字段，直接跳过。
+            if mlp is None or not hasattr(mlp, "experts"):
+                continue
+
+            # 保留 gate/shared_expert/shared_expert_gate，只把 routed experts 替换为按需加载版本。
+            mlp.experts = Qwen2OnDemandExperts(
+                model_config,
+                layer_idx=layer_idx,
+                cache_manager=cache_manager,
+                prefetcher=prefetcher,
+            )
+
+        return model
     

@@ -1,43 +1,61 @@
-import gc
+import torch
+import os
 import sys
-from pathlib import Path
+from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeForCausalLM
+from transformers.models.qwen2_moe.configuration_qwen2_moe import Qwen2MoeConfig
 
-# 当前文件路径配置
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+# ------------------ 初始化空壳模型 ------------------
+config = Qwen2MoeConfig.from_pretrained("D:\Projects\Moe-offload-demo\models\Qwen1.5-Moe-A2.7B\config.json")
+with torch.device('meta'):
+    model = Qwen2MoeForCausalLM(config)
 
-from moe_runtime import Qwen15MoeA27BAdapter, ResidentWeightLoader, get_parameter_device_stats
+# ------------------ 内存与设备检测 ------------------
+print("=" * 60)
+print("模型创建完成，开始检测资源占用...")
+print("=" * 60)
 
-# 打印分设备统计结果
-def print_device_stats(stats, title):
-    print(f"\n[统计] {title}")
-    print(f"Meta设备 参数: {stats['meta']['params']:,} | 占用: {stats['meta']['mb']} MB")
-    print(f"CPU设备  参数: {stats['cpu']['params']:,} | 占用: {stats['cpu']['mb']} MB")
-    print(f"GPU设备  参数: {stats['cuda']['params']:,} | 占用: {stats['cuda']['mb']} MB")
-    total_params = stats['meta']['params'] + stats['cpu']['params'] + stats['cuda']['params']
-    total_mb = stats['meta']['mb'] + stats['cpu']['mb'] + stats['cuda']['mb']
-    print(f"[总计] 参数: {total_params:,} | 总计占用: {round(total_mb, 2)} MB")
+# 1. 统计参数数量与理论内存（如果为真实张量）
+total_params = 0
+total_bytes = 0
+device_counter = {}
+for name, param in model.named_parameters():
+    total_params += param.numel()
+    elem_size = param.element_size()  # 对于 meta 张量，仍然返回 dtype 对应的字节数
+    total_bytes += param.numel() * elem_size
+    # 记录每个设备出现的次数
+    dev = str(param.device)
+    device_counter[dev] = device_counter.get(dev, 0) + 1
 
-def main() -> None:
-    model_dir = "models/Qwen1.5-Moe-A2.7B"
-    manifest_path = "models/Qwen1.5-Moe-A2.7B/weight_manifest.json"
-    device = "cuda"
+print(f"参数总数: {total_params:,}")
+print(f"若为真实张量，理论内存: {total_bytes / 1024**3:.2f} GB")
+print(f"\n参数设备分布: {device_counter}")
 
-    # ============== 测试：通过通用 Loader + Qwen Adapter 加载 ==============
-    print("\n" + "="*80)
-    print("[测试] 通用 ResidentWeightLoader + Qwen15MoeA27BAdapter")
-    loader = ResidentWeightLoader(adapter=Qwen15MoeA27BAdapter())
-    model = loader.load(
-        model_dir=model_dir,
-        manifest_path=manifest_path,
-        device=device,
-    )
-    stats = get_parameter_device_stats(model)
-    print_device_stats(stats, "常驻权重加载 设备分布")
-    print(f"加载报告: {model.moe_load_report}")
-    del model
-    gc.collect()
+# 2. 展示一个参数的具体信息
+print("\n示例参数（第一个）:")
+for name, param in model.named_parameters():
+    print(f"  {name}: shape={param.shape}, device={param.device}, dtype={param.dtype}")
+    break
 
-if __name__ == "__main__":
-    main()
+# 3. 检查当前进程的实际内存（可选，需要 psutil）
+try:
+    import psutil
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    print(f"\n当前进程物理内存占用: {mem_info.rss / 1024**2:.2f} MB")
+except ImportError:
+    print("\n(未安装 psutil，无法显示实际内存，但可观察系统监视器)")
+
+# 4. CUDA 显存占用（应该为 0）
+if torch.cuda.is_available():
+    print(f"\n当前 GPU 显存分配: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+    print(f"当前 GPU 显存缓存: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+else:
+    print("\n未检测到 GPU，跳过显存统计")
+
+# 5. 验证 meta 张量无法参与计算
+print("\n尝试对 meta 张量做加法（预期抛出 RuntimeError）:")
+try:
+    dummy = next(model.parameters())
+    _ = dummy + dummy
+except RuntimeError as e:
+    print(f"  捕获预期错误: {e}")

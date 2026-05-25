@@ -8,7 +8,7 @@ from typing import Any
 # Adapter 基类。
 from .base import MoeModelAdapter
 # 当前第一版只注册 Qwen1.5-MoE Adapter。
-from .qwen15_moe import Qwen15MoeAdapter
+from .qwen15_moe_adapter import Qwen15MoeAdapter
 
 
 # Adapter 注册表。后续新增 PhiMoE/Mixtral/DeepSeek 时，把对应 Adapter 类加入这里。
