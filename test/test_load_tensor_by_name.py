@@ -82,19 +82,22 @@ def main() -> None:
 
     tensorloader = ManifestTensorLoader(model_dir = model_dir, manifest_path = manifest_path)
 
-    tensor_name = args.tensor_name if args.tensor_name else "lm_head.weight"
-    tensor = tensorloader.load_tensor_by_name(tensor_name=tensor_name, device=device)
+    #tensor_name = args.tensor_name if args.tensor_name else "lm_head.weight"
+    #tensor = tensorloader.load_tensor_by_name(tensor_name=tensor_name, device=device)
 
+    tensor_names = ["lm_head.weight","model.embed_tokens.weight"]
+    tensors = tensorloader.load_tensors_by_names(tensor_names=tensor_names, device=device)
     # ===================== 新增/优化打印 =====================
-    print(f"✅ 成功加载张量: {tensor_name}")
-    print(f"📦 Tensor 形状: {tensor.shape}")       # 你要求的形状打印
-    print(f"🔣 Tensor 类型: {tensor.dtype}")
-    print(f"📱 Tensor 设备: {tensor.device}")
-    # ========================================================
+    for tensor_name in tensor_names:
+        print(f"✅ 成功加载张量: {tensor_name}")
+        print(f"📦 Tensor 形状: {tensors[tensor_name].shape}")       # 你要求的形状打印
+        print(f"🔣 Tensor 类型: {tensors[tensor_name].dtype}")
+        print(f"📱 Tensor 设备: {tensors[tensor_name].device}")
+        # ========================================================
 
-    # 如果用户明确要求打印值，才输出 tensor 内容。
-    if args.print_values:
-        print(tensor)
+        # 如果用户明确要求打印值，才输出 tensor 内容。
+        if args.print_values:
+            print(tensors[tensor_name])
 
 
 # 只有直接执行该脚本时才运行 main()；被其他代码 import 时只提供 load_tensor_by_name 函数。

@@ -51,7 +51,7 @@ class Qwen2OnDemandExperts(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        top_k_index: torch.Tensor,
+        top_k_index: torch.Tensor, # [num_tokens, top_k]
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         """执行 routed experts 计算。
@@ -65,14 +65,16 @@ class Qwen2OnDemandExperts(nn.Module):
 
         # 根据 router 选中的 expert id 构造专家命中表，形状变为 [num_experts, top_k, num_tokens]。
         with torch.no_grad():
+            # 形状变为 [num_tokens, top_k, nums_experts]
             expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
+            # 形状变为 [num_experts, top_k, num_tokens]
             expert_mask = expert_mask.permute(2, 1, 0)
+            # [num_active_experts, 1]
             expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
 
         # 如果配置了预取器，先把本次实际命中的 expert id 告诉预取器。
-        if self.prefetcher is not None:
-            expert_ids = [int(expert_idx.item()) for expert_idx in expert_hit.flatten()]
-            self.prefetcher.prefetch(layer_idx=self.layer_idx, expert_ids=expert_ids)
+        #if self.prefetcher is not None:
+        #    self.prefetcher.prefetch(layer_idx=self.layer_idx)
 
         # 当前版本只定义 cache_manager 接口，具体加载、缓存和显存管理后续实现。
         if self.cache_manager is None:
@@ -90,38 +92,16 @@ class Qwen2OnDemandExperts(nn.Module):
             # 取出当前 expert 需要处理的 token hidden states。
             current_state = hidden_states[token_idx]
 
-            # 向 cache_manager 请求当前层、当前专家的权重或可调用专家对象。
-            expert_id = int(expert_idx.item())
-            expert = self.cache_manager.get_expert(layer_idx=self.layer_idx, expert_idx=expert_id)
+            # 向 cache_manager 请求当前层、当前专家的权重或可调用专家对象
+            expert_tensor_dict = self.cache_manager.get_expert(layer_idx=self.layer_idx, expert_idx=expert_idx)
 
-            # 如果 cache_manager 返回的是 nn.Module 或其他可调用对象，就直接执行。
-            if callable(expert):
-                current_hidden_states = expert(current_state)
-            else:
-                # 如果返回的是官方 packed 形式权重，按 gate_up_proj + down_proj 执行。
-                gate_up_proj = expert.get("gate_up_proj", expert.get("gate_up_proj.weight"))
-                down_proj = expert.get("down_proj", expert.get("down_proj.weight"))
+            gate = nn.functional.linear(current_state, expert_tensor_dict["gate"])
+            up = nn.functional.linear(current_state, expert_tensor_dict["up"])
+            current_hidden_states = self.act_fn(gate) * up
+            current_hidden_states = nn.functional.linear(current_hidden_states, expert_tensor_dict["down"])
+            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
 
-                if gate_up_proj is not None and down_proj is not None:
-                    gate, up = nn.functional.linear(current_state, gate_up_proj).chunk(2, dim=-1)
-                    current_hidden_states = self.act_fn(gate) * up
-                    current_hidden_states = nn.functional.linear(current_hidden_states, down_proj)
-                else:
-                    # 如果返回的是 checkpoint 原始三权重形式，按 gate_proj/up_proj/down_proj 执行。
-                    gate_proj = expert.get("gate_proj", expert.get("gate_proj.weight", expert.get("gate")))
-                    up_proj = expert.get("up_proj", expert.get("up_proj.weight", expert.get("up")))
-                    down_proj = expert.get("down_proj", expert.get("down_proj.weight", expert.get("down")))
-
-                    if gate_proj is None or up_proj is None or down_proj is None:
-                        raise KeyError(
-                            "cache_manager.get_expert 必须返回可调用 expert，"
-                            "或包含 gate_up_proj/down_proj，"
-                            "或包含 gate_proj/up_proj/down_proj 的权重字典。"
-                        )
-
-                    current_hidden_states = self.act_fn(nn.functional.linear(current_state, gate_proj))
-                    current_hidden_states = current_hidden_states * nn.functional.linear(current_state, up_proj)
-                    current_hidden_states = nn.functional.linear(current_hidden_states, down_proj)
 
             # 乘以 router 给出的 top-k 权重。
             current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]

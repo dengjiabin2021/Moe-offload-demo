@@ -55,6 +55,48 @@ class ManifestTensorLoader:
         self.model_dir = Path(model_dir)
         self.manifest_path = Path(manifest_path)
         self._manifest: Dict[str, Dict[str, Any]] | None = None
+        self._load_manifest_json()
+        
+    def load_tensors_by_names(self, *, tensor_names: list[str], device: str) -> dict[str, torch.Tensor]:
+        """根据 tensor_names 从 safetensors 分片中读取一系列 torch.Tensor。"""
+
+        if self._manifest is None:
+            self._load_manifest_json()
+
+        # 1. 收集所有需要的条目，并按分片分组
+        shard_groups: dict[Path, list[tuple[str, dict]]] = {}
+        for name in tensor_names:
+            entry = self._read_manifest_entry(tensor_name=name)
+            shard_path = self.model_dir / entry["file"]
+            shard_groups.setdefault(shard_path, []).append((name, entry))
+
+        result: dict[str, torch.Tensor] = {}
+
+        # 2. 逐分片处理
+        for shard_path, items in shard_groups.items():
+            if not shard_path.is_file():
+                raise FileNotFoundError(f"Shard not found: {shard_path}")
+
+            # 按 offset 排序，利于顺序读取
+            items.sort(key=lambda x: x[1]["offset"])
+
+            with open(shard_path, "rb") as f:
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                    for name, entry in items:
+                        dtype_name = entry["dtype"]
+                        torch_dtype = self._to_torch_dtype(dtype_name)
+                        offset = entry["offset"]
+                        nbytes = entry["nbytes"]
+                        element_size = torch.empty((), dtype=torch_dtype).element_size()
+
+                        # 从 mmap 中切片并 clone（clone 后才拥有独立内存）
+                        tensor = torch.frombuffer(mm, dtype=torch_dtype, offset=offset,
+                                                count=nbytes // element_size).clone()
+                        tensor = tensor.reshape(entry["shape"]).to(device)
+                        result[name] = tensor
+
+        # 确保所有请求的名称都有返回（可通过检查 result 长度）
+        return result
 
     def load_tensor_by_name(self, *, tensor_name: str, device: str) -> torch.Tensor:
         """根据 tensor_name 从 safetensors 分片中读取一个 torch.Tensor。"""

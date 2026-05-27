@@ -7,6 +7,7 @@ from typing import Any
 
 from pathlib import Path
 
+import torch
 # nn.Module 用于返回类型标注。
 from torch import nn
 
@@ -50,7 +51,7 @@ class Qwen15MoeAdapter(MoeModelAdapter):
         """构造 Qwen2MoeForCausalLM 空模型。"""
 
         # 内置空模型上下文，无需外部依赖，100% 返回空模型
-        with init_empty_weights():
+        with torch.device('meta'):
             model = Qwen2MoeForCausalLM(model_config)
         return model
 
