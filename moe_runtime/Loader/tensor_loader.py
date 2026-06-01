@@ -145,16 +145,26 @@ class ManifestTensorLoader:
         # 如果用户指定 cuda 等设备，这里再把 tensor 移动过去。
         return tensor.to(device)
 
-    def _load_manifest_json(self) -> None:
+    def get_tensor_info(self,*, tensor_name: str) -> tuple[list[int,int], int, torch.dtype]:
+        """ 返回某个张量的形状，总元素个数，数据类型"""
+        entry = self._read_manifest_entry(tensor_name=tensor_name)
+        
+        dtype_name = entry["dtype"]
 
-        if not self.manifest_path.is_file():
-            raise FileNotFoundError(
-                f"Manifest does not exist: {self.manifest_path}. "
-            )
+        # 把 safetensors dtype 转成 torch dtype
+        torch_dtype = self._to_torch_dtype(dtype_name)
 
-        # 按 UTF-8 读取 JSON，顶层应该是 {tensor_name: entry}。
-        with self.manifest_path.open("r", encoding="utf-8") as handle:
-            self._manifest = json.load(handle)
+        shape = entry["shape"]
+
+        nbytes = entry["nbytes"]
+        
+        self._validate_tensor_size(dtype_name=dtype_name, shape=shape, nbytes=nbytes, tensor_name=tensor_name)
+
+        numel = prod(shape)
+
+        return shape, numel, torch_dtype
+
+
 
     def _read_manifest_entry(self, tensor_name: str) -> dict[str, Any]:
         """从 manifest 中取出某个 tensor 的条目。"""
@@ -166,6 +176,17 @@ class ManifestTensorLoader:
         # 返回该 tensor 的 file、offset、nbytes、dtype、shape 信息。
         return self._manifest[tensor_name]
 
+
+    def _load_manifest_json(self) -> None:
+
+        if not self.manifest_path.is_file():
+            raise FileNotFoundError(
+                f"Manifest does not exist: {self.manifest_path}. "
+            )
+
+        # 按 UTF-8 读取 JSON，顶层应该是 {tensor_name: entry}。
+        with self.manifest_path.open("r", encoding="utf-8") as handle:
+            self._manifest = json.load(handle)
 
     def _to_torch_dtype(self, dtype_name: str) -> torch.dtype:
         """把 safetensors dtype 名转换成 torch dtype。"""

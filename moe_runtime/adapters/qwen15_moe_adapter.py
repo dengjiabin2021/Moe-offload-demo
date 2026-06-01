@@ -19,7 +19,7 @@ from transformers.models.qwen2_moe.configuration_qwen2_moe import Qwen2MoeConfig
 
 
 # 引入 Adapter 基类和结构化返回类型。
-from .base import ExpertWeightSpec, MoeModelAdapter
+from .base import MoeModelAdapter
 from moe_runtime.blocks.qwen2_moe_block import Qwen2OnDemandExperts
 
 
@@ -61,21 +61,18 @@ class Qwen15MoeAdapter(MoeModelAdapter):
     def is_shared_expert_tensor(self, tensor_name: str) -> bool:
         return self.shared_expert_re.match(tensor_name) is not None
 
-    def routed_expert_weight_spec(self, layer_idx: int, expert_idx: int) -> ExpertWeightSpec:
+    def routed_expert_weight_name(self, layer_idx: int, expert_idx: int) -> dict[str,str]:
 
         # Qwen expert 由 gate_proj/up_proj/down_proj 三个无 bias 线性层组成。
         prefix = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}"
-
+        
+        idxs_to_name = { 
+                        "gate": f"{prefix}.gate_proj.weight",
+                        "up": f"{prefix}.up_proj.weight",
+                        "down": f"{prefix}.down_proj.weight"
+                        }
         # 用通用 ExpertWeightSpec 表达，后续 ModelRuntime/ExpertRuntime 不需要硬编码 Qwen 命名。
-        return ExpertWeightSpec(
-            layer_idx=layer_idx,
-            expert_idx=expert_idx,
-            tensors={
-                "gate": f"{prefix}.gate_proj.weight",
-                "up": f"{prefix}.up_proj.weight",
-                "down": f"{prefix}.down_proj.weight",
-            },
-        )
+        return idxs_to_name
     
     def patch_moe_block(
         self,

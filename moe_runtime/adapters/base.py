@@ -9,26 +9,12 @@ from pathlib import Path
 # Any 用于 transformers config、manifest metadata、runtime block 等类型占位。
 from typing import Any, Iterable
 
+import torch
 # nn.Module 是 transformers 模型和 block 的通用基类。
 from torch import nn
 
 # RuntimeConfig 用于根据用户配置决定常驻设备。
 from moe_runtime.config import RuntimeConfig
-
-
-@dataclass(frozen=True)
-class ExpertWeightSpec:
-    """描述某个 expert 需要从 checkpoint 中读取哪些 tensor。"""
-
-    # Transformer 层编号。
-    layer_idx: int
-
-    # 当前层内 expert 编号。
-    expert_idx: int
-
-    # 权重角色到 tensor name 的映射。
-    # 不同模型可以使用不同角色名，例如 gate/up/down 或 w1/w2/w3。
-    tensors: dict[str, str]
 
 
 
@@ -71,7 +57,7 @@ class MoeModelAdapter(ABC):
         """判断 checkpoint manifest 中的 tensor 是否是 shared expert 权重。"""
 
     @abstractmethod
-    def routed_expert_weight_spec(self, layer_idx: int, expert_idx: int) -> ExpertWeightSpec:
+    def routed_expert_weight_name(self, layer_idx: int, expert_idx: int) -> dict[str, str]:
         """返回某层某个 expert 所需的 tensor_name 映射。"""
 
     @abstractmethod

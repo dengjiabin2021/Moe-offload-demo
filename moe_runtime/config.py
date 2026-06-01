@@ -35,11 +35,11 @@ class RuntimeConfig:
     # 预取策略。
     prefetch_policy: str = "none"
 
-    # CPU cache 的容量上限。
-    max_cpu_cache_bytes: int | None = None
+    # CPU 缓存容量上限
+    max_cpu_cache_capacity: dict[int, int] = None
 
-    # GPU cache 的容量上限。
-    max_gpu_cache_bytes: int | None = None
+    # GPU 缓存容量上限
+    max_gpu_cache_capacity: dict[int, int] = None
 
     def __post_init__(self) -> None:
         """规范化路径字段，保证 RuntimeEngine 内部拿到的是 Path。"""
