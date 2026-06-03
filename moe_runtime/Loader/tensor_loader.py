@@ -98,6 +98,52 @@ class ManifestTensorLoader:
         # 确保所有请求的名称都有返回（可通过检查 result 长度）
         return result
 
+    def load_tensors_to_buffer(self, *, tensor_names: list[str], buffer: torch.Tensor, slot_idx: int) -> None:
+        """从 mmap 零拷贝读取张量，按 tensor_names 顺序写入预分配 2D buffer。
+
+        与 load_tensors_by_names 不同：
+        - 不 clone，不 to(device)，不返回中间 dict
+        - 用 frombuffer 创建 mmap 视图后直接 copy_ 到 buffer，每张量仅一次搬运
+
+        buffer 形状应为 [num_slots, expert_elems]。
+        """
+        if self._manifest is None:
+            self._load_manifest_json()
+
+        # 1. 按 tensor_names 顺序收集条目，同时预计算各 tensor 在 buffer 行的起始偏移
+        shard_groups: dict[Path, list[tuple[str, dict, int]]] = {}
+        buf_offset = 0
+        for name in tensor_names:
+            entry = self._read_manifest_entry(tensor_name=name)
+            element_size = torch.empty((), dtype=self._to_torch_dtype(entry["dtype"])).element_size()
+            count = entry["nbytes"] // element_size
+
+            shard_path = self.model_dir / entry["file"]
+            shard_groups.setdefault(shard_path, []).append((name, entry, buf_offset))
+            buf_offset += count
+
+        # 2. 逐分片处理
+        for shard_path, items in shard_groups.items():
+            if not shard_path.is_file():
+                raise FileNotFoundError(f"Shard not found: {shard_path}")
+
+            # 按文件 offset 排序，利于顺序读取
+            items.sort(key=lambda x: x[1]["offset"])
+
+            with open(shard_path, "rb") as f:
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                    for _, entry, buf_start in items:
+                        dtype_name = entry["dtype"]
+                        torch_dtype = self._to_torch_dtype(dtype_name)
+                        offset = entry["offset"]
+                        nbytes = entry["nbytes"]
+                        element_size = torch.empty((), dtype=torch_dtype).element_size()
+                        count = nbytes // element_size
+
+                        # frombuffer 零拷贝视图 → 按 tensor_names 顺序写入 buffer 对应位置
+                        tensor = torch.frombuffer(mm, dtype=torch_dtype, offset=offset, count=count)
+                        buffer[slot_idx, buf_start : buf_start + count].copy_(tensor.flatten())
+
     def load_tensor_by_name(self, *, tensor_name: str, device: str) -> torch.Tensor:
         """根据 tensor_name 从 safetensors 分片中读取一个 torch.Tensor。"""
 
@@ -164,6 +210,11 @@ class ManifestTensorLoader:
 
         return shape, numel, torch_dtype
 
+    def has_tensor(self, *, tensor_name: str) -> bool:
+        """检查 manifest 中是否存在某个 tensor_name。"""
+        if self._manifest is None:
+            self._load_manifest_json()
+        return tensor_name in self._manifest
 
 
     def _read_manifest_entry(self, tensor_name: str) -> dict[str, Any]:

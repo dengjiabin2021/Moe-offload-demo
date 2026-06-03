@@ -72,9 +72,6 @@ class Qwen2OnDemandExperts(nn.Module):
             # [num_active_experts, 1]
             expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
 
-        # 如果配置了预取器，先把本次实际命中的 expert id 告诉预取器。
-        #if self.prefetcher is not None:
-        #    self.prefetcher.prefetch(layer_idx=self.layer_idx)
 
         # 当前版本只定义 cache_manager 接口，具体加载、缓存和显存管理后续实现。
         if self.cache_manager is None:

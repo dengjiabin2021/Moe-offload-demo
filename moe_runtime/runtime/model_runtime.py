@@ -76,6 +76,15 @@ class ModelRuntime:
         self.model.eval()
         self.model.requires_grad_(False)
 
+        # 注册 forward hook：每次 forward 推进 cache step，驱动 LRU 老化
+        if self.cache_manager is not None:
+            def _step_hook(_module, _args, _kwargs, output):
+                self.cache_manager.step()
+                return output
+            self.model.register_forward_hook(_step_hook)
+
+        self.is_loaded = True
+
 
     def generate(self, *args: Any, **kwargs: Any) -> Any:
         """调用底层模型 generate。"""
@@ -96,7 +105,8 @@ class ModelRuntime:
 
         if self.model is None:
             raise RuntimeError("ModelRuntime.model 为空，无法加载常驻权重。")
-
+        
+        # ---- 1. 加载常驻 param ----
         # 只从当前模型结构中收集参数名，不在这里读取 manifest/json。
         resident_param_names: list[str] = []
 
@@ -130,3 +140,32 @@ class ModelRuntime:
 
             # 用 PyTorch 标准属性赋值替换参数，同时保持模块属性和参数注册表一致。
             setattr(parent_module, param_name, nn.Parameter(tensor, requires_grad=False))
+
+        # ---- 2. 加载常驻 Buffer（仅限 manifest 中存在的） ----
+        resident_buffer_names: list[str] = []
+
+        for name, _buf in self.model.named_buffers():
+            if self.adapter.is_routed_expert_tensor(name):
+                continue
+            if not self.tensor_loader.has_tensor(tensor_name=name):
+                continue
+            resident_buffer_names.append(name)
+
+        if resident_buffer_names:
+            buffer_tensors = self.tensor_loader.load_tensors_by_names(
+                tensor_names=resident_buffer_names,
+                device=self.runtime_config.non_expert_device,
+            )
+            for name in resident_buffer_names:
+                tensor = buffer_tensors[name]
+                if "." in name:
+                    parent_name, buf_name = name.rsplit(".", 1)
+                    parent_module = self.model.get_submodule(parent_name)
+                else:
+                    parent_module = self.model
+                    buf_name = name
+                # buffer 不包 nn.Parameter，直接赋值 Tensor
+                setattr(parent_module, buf_name, tensor)
+
+        # ---- 3. Materialize 残留的 meta tensor（由 adapter 处理模型差异） ----
+        self.adapter.materialize_meta_tensors(self.model, torch.device(self.runtime_config.non_expert_device))

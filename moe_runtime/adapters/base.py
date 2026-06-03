@@ -64,3 +64,19 @@ class MoeModelAdapter(ABC):
     def patch_moe_block(self, model: nn.Module) -> nn.Module:
         """将原始 MoE block替换"""
 
+    def materialize_meta_tensors(self, model: nn.Module, target_device: torch.device) -> None:
+        """Materialize 残留的 meta tensor。
+
+        像 RoPE 的 inv_freq 这样 persistent=False 的计算 buffer，
+        在 meta device 上构建时没有真实数据，需要在此重新计算并迁移到目标设备。
+        默认实现遍历所有模块，用 torch.empty 填充任何还在 meta 上的 buffer / parameter。
+        子类可重写以正确处理特定计算 buffer（如 inv_freq 重算）。
+        """
+        for module in model.modules():
+            for buf_name, buf in list(module.named_buffers(recurse=False)):
+                if buf.device.type != "meta":
+                    continue
+                module.register_buffer(
+                    buf_name,
+                    torch.empty(buf.shape, dtype=buf.dtype, device=target_device),
+                )

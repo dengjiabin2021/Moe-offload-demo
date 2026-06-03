@@ -103,4 +103,20 @@ class Qwen15MoeAdapter(MoeModelAdapter):
             )
 
         return model
-    
+
+    def materialize_meta_tensors(self, model: nn.Module, target_device: torch.device) -> None:
+        """Qwen MoE 专用：重算 RoPE inv_freq 并 materialize 残留 meta tensor。"""
+        for module in model.modules():
+            for buf_name, buf in list(module.named_buffers(recurse=False)):
+                if buf.device.type != "meta":
+                    continue
+                # inv_freq 是 persistent=False 的计算 buffer，需要按 RoPE 公式重算
+                if buf_name in ("inv_freq", "original_inv_freq") and hasattr(module, "base") and hasattr(module, "dim"):
+                    inv_freq = 1.0 / (
+                        module.base
+                        ** (
+                            torch.arange(0, module.dim, 2, dtype=torch.int64).float().to(target_device)
+                            / module.dim
+                        )
+                    )
+                    module.register_buffer(buf_name, inv_freq)
