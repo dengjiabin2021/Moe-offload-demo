@@ -64,6 +64,7 @@ class MoeModelAdapter(ABC):
     def patch_moe_block(self, model: nn.Module) -> nn.Module:
         """将原始 MoE block替换"""
 
+    @abstractmethod
     def materialize_meta_tensors(self, model: nn.Module, target_device: torch.device) -> None:
         """Materialize 残留的 meta tensor。
 
@@ -72,11 +73,3 @@ class MoeModelAdapter(ABC):
         默认实现遍历所有模块，用 torch.empty 填充任何还在 meta 上的 buffer / parameter。
         子类可重写以正确处理特定计算 buffer（如 inv_freq 重算）。
         """
-        for module in model.modules():
-            for buf_name, buf in list(module.named_buffers(recurse=False)):
-                if buf.device.type != "meta":
-                    continue
-                module.register_buffer(
-                    buf_name,
-                    torch.empty(buf.shape, dtype=buf.dtype, device=target_device),
-                )

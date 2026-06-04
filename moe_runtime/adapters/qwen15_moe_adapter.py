@@ -111,12 +111,15 @@ class Qwen15MoeAdapter(MoeModelAdapter):
                 if buf.device.type != "meta":
                     continue
                 # inv_freq 是 persistent=False 的计算 buffer，需要按 RoPE 公式重算
-                if buf_name in ("inv_freq", "original_inv_freq") and hasattr(module, "base") and hasattr(module, "dim"):
+                if buf_name in ("inv_freq", "original_inv_freq") and hasattr(module, "config"):
+                    config = module.config
+                    head_dim = getattr(config, "head_dim", None) or (config.hidden_size // config.num_attention_heads)
+                    base = config.rope_parameters["rope_theta"]
                     inv_freq = 1.0 / (
-                        module.base
+                        base
                         ** (
-                            torch.arange(0, module.dim, 2, dtype=torch.int64).float().to(target_device)
-                            / module.dim
+                            torch.arange(0, head_dim, 2, dtype=torch.int64).float().to(target_device)
+                            / head_dim
                         )
                     )
                     module.register_buffer(buf_name, inv_freq)

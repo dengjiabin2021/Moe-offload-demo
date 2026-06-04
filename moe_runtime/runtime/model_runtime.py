@@ -78,7 +78,7 @@ class ModelRuntime:
 
         # 注册 forward hook：每次 forward 推进 cache step，驱动 LRU 老化
         if self.cache_manager is not None:
-            def _step_hook(_module, _args, _kwargs, output):
+            def _step_hook(_module, _args, output):
                 self.cache_manager.step()
                 return output
             self.model.register_forward_hook(_step_hook)
