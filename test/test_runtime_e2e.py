@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--prompt",
-        default="早上好啊",
+        default="你是什么模型",
         help="测试用 prompt。",
     )
     parser.add_argument(
@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gpu-cache-per-layer",
         type=int,
-        default=5,
+        default=7,
         help="GPU 每层缓存专家数，默认 5。",
     )
     parser.add_argument(
@@ -174,7 +174,7 @@ def main() -> None:
     output_ids = engine.generate(
         input_ids=input_ids,
         max_new_tokens=args.max_new_tokens,
-        do_sample=False,
+        do_sample=True,
     )
     gen_sec = time.perf_counter() - start
     generated_tokens = output_ids.shape[1] - input_ids.shape[1]
