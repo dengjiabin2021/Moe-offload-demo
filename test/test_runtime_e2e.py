@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--prompt",
-        default="say hi to me",
+        default="早上好啊",
         help="测试用 prompt。",
     )
     parser.add_argument(
@@ -44,14 +44,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gpu-cache-per-layer",
         type=int,
-        default=2,
-        help="GPU 每层缓存专家数，默认 2。",
+        default=5,
+        help="GPU 每层缓存专家数，默认 5。",
     )
     parser.add_argument(
         "--cpu-cache-per-layer",
         type=int,
-        default=4,
-        help="CPU 每层缓存专家数，默认 4。",
+        default=6,
+        help="CPU 每层缓存专家数，默认 6。",
     )
     return parser.parse_args()
 
@@ -190,6 +190,7 @@ def main() -> None:
     # 9. 显存统计
     if torch.cuda.is_available() and expected_device.startswith("cuda"):
         print(f"\nStep 8: GPU 显存统计")
+        print(f"  显卡总显存：{torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f}GB")
         print(f"  当前已分配: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
         print(f"  当前已保留: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
         print(f"  峰值已分配: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB")
