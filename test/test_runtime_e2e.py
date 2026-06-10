@@ -171,11 +171,12 @@ def main() -> None:
         torch.cuda.reset_peak_memory_stats()
 
     start = time.perf_counter()
-    output_ids = engine.generate(
-        input_ids=input_ids,
-        max_new_tokens=args.max_new_tokens,
-        do_sample=False,
-    )
+    with torch.no_grad():
+        output_ids = engine.generate(
+            input_ids=input_ids,
+            max_new_tokens=args.max_new_tokens,
+            do_sample=False,
+        )
     gen_sec = time.perf_counter() - start
     generated_tokens = output_ids.shape[1] - input_ids.shape[1]
     print(f"  生成完成，耗时 {gen_sec:.2f}s, tokens={generated_tokens}")
@@ -203,3 +204,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+from transformers import DeepseekV2ForCausalLM

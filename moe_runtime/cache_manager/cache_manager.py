@@ -301,7 +301,7 @@ class ExpertCacheManager:
         以 layer 0, expert 0 采样（所有 MoE 层专家结构一致）。
         adapter 负责提供张量名，tensor_loader 负责提供 shape / dtype。
         """
-        spec = self.adapter.routed_expert_weight_name(0, 0)
+        spec = self.adapter.routed_expert_weight_name(1, 0)
         role_names = list(spec.keys())
         tensor_names = list(spec.values())
         

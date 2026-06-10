@@ -9,11 +9,12 @@ from typing import Any
 from .base import MoeModelAdapter
 # 当前第一版只注册 Qwen1.5-MoE Adapter。
 from .qwen15_moe_adapter import Qwen15MoeAdapter
-
+from .deepseekv2_moe_adapter import DeepseekV2MoeAdapter
 
 # Adapter 注册表。后续新增 PhiMoE/Mixtral/DeepSeek 时，把对应 Adapter 类加入这里。
 ADAPTER_REGISTRY: list[type[MoeModelAdapter]] = [
     Qwen15MoeAdapter,
+    DeepseekV2MoeAdapter
 ]
 
 

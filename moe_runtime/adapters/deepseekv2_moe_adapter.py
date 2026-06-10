@@ -1,0 +1,134 @@
+from __future__ import annotations
+
+# re 用于匹配 DeepSeek-V2 checkpoint 中的 expert/shared expert 权重名。
+import re
+# Any 用于 transformers config 和 runtime 组件类型标注。
+from typing import Any
+
+import torch
+# nn.Module 用于返回类型标注。
+from torch import nn
+
+# DeepSeek-V2 在 transformers 中的模型实现。
+from transformers.models.deepseek_v2.modeling_deepseek_v2 import DeepseekV2ForCausalLM
+from transformers.models.deepseek_v2.configuration_deepseek_v2 import DeepseekV2Config
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+# 引入 Adapter 基类。
+from .base import MoeModelAdapter
+from moe_runtime.blocks.deepseekv2_moe_block import DeepseekV2OnDemandExperts
+
+
+class DeepseekV2MoeAdapter(MoeModelAdapter):
+    """DeepSeek-V2-Lite MoE 适配器。"""
+
+    supported_model_types: list[str] = ["deepseek_v2"]
+
+    # checkpoint 中 routed expert 权重名：
+    # model.layers.1.mlp.experts.0.gate_proj.weight
+    routed_expert_re = re.compile(
+        r"^model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+        r"(?P<proj>gate_proj|up_proj|down_proj)\.weight$"
+    )
+
+    # checkpoint 中 shared expert / router 权重名：
+    # model.layers.1.mlp.shared_experts.gate_proj.weight
+    # model.layers.1.mlp.gate.weight
+    shared_expert_re = re.compile(
+        r"^model\.layers\.(?P<layer>\d+)\.mlp\."
+        r"(?P<name>shared_experts\.(gate_proj|up_proj|down_proj)\.weight|gate\.weight)$"
+    )
+
+    def match(self, model_config: DeepseekV2Config) -> bool:
+        """判断当前 Adapter 是否支持这个模型。"""
+
+        # 默认通过 config.model_type 匹配；特殊模型可在子类重写。
+        return getattr(model_config, "model_type", None) in self.supported_model_types
+
+    def build_empty_model(self, model_config: DeepseekV2Config) -> DeepseekV2ForCausalLM:
+        """构造 DeepseekV2ForCausalLM 空模型。"""
+
+        # 内置 meta device 上下文，避免为原始 checkpoint 权重分配真实内存。
+        with torch.device("meta"):
+            model = DeepseekV2ForCausalLM(model_config)
+        return model
+
+    def is_routed_expert_tensor(self, tensor_name: str) -> bool:
+        return self.routed_expert_re.match(tensor_name) is not None
+
+    def is_shared_expert_tensor(self, tensor_name: str) -> bool:
+        return self.shared_expert_re.match(tensor_name) is not None
+
+    def routed_expert_weight_name(self, layer_idx: int, expert_idx: int) -> dict[str, str]:
+        # DeepSeek-V2 expert 由 gate_proj/up_proj/down_proj 三个无 bias 线性层组成。
+        prefix = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}"
+
+        idxs_to_name = {
+            "gate": f"{prefix}.gate_proj.weight",
+            "up": f"{prefix}.up_proj.weight",
+            "down": f"{prefix}.down_proj.weight",
+        }
+        # 后续 CacheManager 按 gate/up/down 三个角色恢复专家权重。
+        return idxs_to_name
+
+    def patch_moe_block(
+        self,
+        model: nn.Module,
+        model_config: DeepseekV2Config,
+        cache_manager: Any | None = None,
+        prefetcher: Any | None = None,
+    ) -> nn.Module:
+        """只替换 DeepSeek-V2 MoE block 内部的 routed experts。"""
+
+        # DeepseekV2ForCausalLM 的 decoder layers 通常位于 model.model.layers。
+        layers = model.model.layers
+
+        # 第 0 层通常是 dense MLP；只有带 experts 字段的 MoE 层需要替换。
+        for layer_idx, layer in enumerate(layers):
+            mlp = getattr(layer, "mlp", None)
+
+            if mlp is None or not hasattr(mlp, "experts"):
+                continue
+
+            # 保留 gate/shared_experts，只把 routed experts 替换为后续实现的按需加载模块。
+            mlp.experts = DeepseekV2OnDemandExperts(
+                model_config,
+                layer_idx=layer_idx,
+                cache_manager=cache_manager,
+                prefetcher=prefetcher,
+            )
+
+        return model
+
+    def materialize_meta_tensors(self, model: nn.Module, target_device: torch.device) -> None:
+        """DeepSeek-V2 专用：重算 RoPE inv_freq 并 materialize 残留 meta buffer。"""
+
+        for module in model.modules():
+            for buf_name, buf in list(module.named_buffers(recurse=False)):
+                if buf.device.type != "meta":
+                    continue
+                # DeepSeek-V2 的 RoPE buffer 由自身 rope_type 决定，不能直接复用 Qwen 的默认公式。
+                if buf_name in ("inv_freq", "original_inv_freq") and hasattr(module, "config"):
+                    self._materialize_rope_buffer(module, target_device)
+                    break
+
+    @staticmethod
+    def _materialize_rope_buffer(module: nn.Module, target_device: torch.device) -> None:
+        """按 DeepseekV2RotaryEmbedding.__init__ 的逻辑重建 RoPE buffer。"""
+
+        config = module.config
+        rope_type = config.rope_parameters["rope_type"]
+        if rope_type == "default":
+            base = config.rope_parameters["rope_theta"]
+            dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+            inv_freq = 1.0 / (
+                base ** ( torch.arange(0, dim, 2, dtype=torch.int64).to(device=target_device, dtype=torch.float) / dim)
+            )
+            attention_scaling = 1.0
+        else:
+            rope_init_fn = ROPE_INIT_FUNCTIONS[rope_type]
+            inv_freq, attention_scaling = rope_init_fn(config, target_device)
+
+        module.attention_scaling = attention_scaling
+        module.register_buffer("inv_freq", inv_freq, persistent=False)
+        module.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)

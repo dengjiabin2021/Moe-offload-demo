@@ -2,11 +2,15 @@
 
 from .base import MoeModelAdapter
 from .qwen15_moe_adapter import Qwen15MoeAdapter
+from .deepseekv2_moe_adapter import DeepseekV2MoeAdapter
 from .registry import ADAPTER_REGISTRY, auto_select_adapter
+
 
 __all__ = [
     "ADAPTER_REGISTRY",
     "MoeModelAdapter",
     "auto_select_adapter",
-    "Qwen15MoeAdapter"
+    "Qwen15MoeAdapter",
+    "DeepseekV2MoeAdapter"
+
 ]

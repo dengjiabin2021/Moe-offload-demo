@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-dir",
-        default=str(REPO_ROOT / "models" / "Qwen1.5-Moe-A2.7B"),
+        default=str(REPO_ROOT / "models" / "DeepSeek-V2-Lite"),
         help="本地模型目录",
     )
     parser.add_argument(
@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--prompt",
-        default="问：你好 答：你好！有什么我可以帮你的吗? 问: 1+1=? 答：",
+        default="中国和美国的首都分别在哪？",
         help="测试用 prompt",
     )
     parser.add_argument(
@@ -83,7 +83,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cpu-cache-per-layer",
         type=int,
-        default=16,
+        default=4,
         help="CPU 每层缓存专家数 (default: 16)",
     )
     parser.add_argument(
@@ -249,12 +249,12 @@ def main() -> None:
     print("\n[6/7] 执行推理 ...")
     if args.device.startswith("cuda"):
         torch.cuda.reset_peak_memory_stats()
-
-    output_ids = engine.generate(
-        input_ids=input_ids,
-        max_new_tokens=args.max_new_tokens,
-        do_sample=False,
-    )
+    with torch.no_grad():
+        output_ids = engine.generate(
+            input_ids=input_ids,
+            max_new_tokens=args.max_new_tokens,
+            do_sample=False,
+        )
     generated_tokens = int(output_ids.shape[1] - input_ids.shape[1])
     output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
     print(f"  生成 token 数: {generated_tokens}")

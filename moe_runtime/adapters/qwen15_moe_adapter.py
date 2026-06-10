@@ -16,7 +16,7 @@ from accelerate import init_empty_weights
 from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeForCausalLM 
 
 from transformers.models.qwen2_moe.configuration_qwen2_moe import Qwen2MoeConfig
-
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
 # 引入 Adapter 基类和结构化返回类型。
 from .base import MoeModelAdapter
@@ -106,20 +106,33 @@ class Qwen15MoeAdapter(MoeModelAdapter):
 
     def materialize_meta_tensors(self, model: nn.Module, target_device: torch.device) -> None:
         """Qwen MoE 专用：重算 RoPE inv_freq 并 materialize 残留 meta tensor。"""
+
         for module in model.modules():
             for buf_name, buf in list(module.named_buffers(recurse=False)):
                 if buf.device.type != "meta":
                     continue
-                # inv_freq 是 persistent=False 的计算 buffer，需要按 RoPE 公式重算
+                # inv_freq/original_inv_freq 是 persistent=False 的计算 buffer，需要按 Qwen2MoeRotaryEmbedding 自身逻辑重建。
                 if buf_name in ("inv_freq", "original_inv_freq") and hasattr(module, "config"):
-                    config = module.config
-                    head_dim = getattr(config, "head_dim", None) or (config.hidden_size // config.num_attention_heads)
-                    base = config.rope_parameters["rope_theta"]
-                    inv_freq = 1.0 / (
-                        base
-                        ** (
-                            torch.arange(0, head_dim, 2, dtype=torch.int64).float().to(target_device)
-                            / head_dim
-                        )
-                    )
-                    module.register_buffer(buf_name, inv_freq)
+                    self._materialize_rope_buffer(module, target_device)
+                    break
+
+    @staticmethod
+    def _materialize_rope_buffer(module: nn.Module, target_device: torch.device) -> None:
+        """按 Qwen2MoeRotaryEmbedding.__init__ 的逻辑重建 RoPE buffer。"""
+
+        config = module.config
+        rope_type = config.rope_parameters["rope_type"]
+        if rope_type == "default":
+            base = config.rope_parameters["rope_theta"]
+            dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+            inv_freq = 1.0 / (
+                base ** ( torch.arange(0, dim, 2, dtype=torch.int64).to(device=target_device, dtype=torch.float) / dim)
+            )
+            attention_scaling = 1.0
+        else:
+            rope_init_fn = ROPE_INIT_FUNCTIONS[rope_type]
+            inv_freq, attention_scaling = rope_init_fn(config, target_device)
+
+        module.attention_scaling = attention_scaling
+        module.register_buffer("inv_freq", inv_freq, persistent=False)
+        module.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
