@@ -71,6 +71,20 @@ class DeepseekV2MoeAdapter(MoeModelAdapter):
         # 后续 CacheManager 按 gate/up/down 三个角色恢复专家权重。
         return idxs_to_name
 
+    def routed_expert_layers(self, model_config: DeepseekV2Config) -> list[int]:
+        """返回 DeepSeek-V2 中包含 routed experts 的 decoder layer 索引。"""
+
+        if getattr(model_config, "n_routed_experts", None) is None:
+            return []
+
+        first_moe_layer = getattr(model_config, "first_k_dense_replace", 0)
+        moe_layer_freq = getattr(model_config, "moe_layer_freq", 1)
+        return [
+            layer_idx
+            for layer_idx in range(model_config.num_hidden_layers)
+            if layer_idx >= first_moe_layer and layer_idx % moe_layer_freq == 0
+        ]
+
     def patch_moe_block(
         self,
         model: nn.Module,
@@ -118,6 +132,9 @@ class DeepseekV2MoeAdapter(MoeModelAdapter):
 
         config = module.config
         rope_type = config.rope_parameters["rope_type"]
+        print("----------------------")
+        print(rope_type)
+        print("----------------------")
         if rope_type == "default":
             base = config.rope_parameters["rope_theta"]
             dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads

@@ -68,6 +68,7 @@ class MoeRuntimeEngine:
             runtime_config=self.config,
             adapter=self.adapter,
             tensor_loader=self.tensor_loader,
+            model_config=self.model_config,
         )
 
         self.model_runtime = ModelRuntime(

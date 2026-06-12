@@ -51,12 +51,17 @@ class ExpertCacheManager:
         runtime_config: RuntimeConfig,
         adapter: Any,
         tensor_loader: ManifestTensorLoader,
+        model_config: Any | None = None,
     ) -> None:
         self.config = runtime_config
         self.adapter = adapter
         self.loader = tensor_loader
+        self.model_config = model_config
         self._cpu_device = "cpu"
         self._gpu_device = "cuda"
+        self._routed_expert_layers = self._resolve_routed_expert_layers()
+        self._cpu_cache_capacity = self._filter_cache_capacity(self.config.max_cpu_cache_capacity)
+        self._gpu_cache_capacity = self._filter_cache_capacity(self.config.max_gpu_cache_capacity)
 
         self._global_step = 0
         self._expert_elems: int = 0
@@ -73,8 +78,8 @@ class ExpertCacheManager:
         self._expert_elems, self._expert_layout, self._expert_dtype = self._probe_expert()
 
         # ---- 按 config 每层容量构建 layer → slot 行范围映射 ----
-        self._num_cpu_experts, self._cpu_layer_slot_map = self._build_layer_slot_mapping(self.config.max_cpu_cache_capacity)
-        self._num_gpu_experts, self._gpu_layer_slot_map = self._build_layer_slot_mapping(self.config.max_gpu_cache_capacity)
+        self._num_cpu_experts, self._cpu_layer_slot_map = self._build_layer_slot_mapping(self._cpu_cache_capacity)
+        self._num_gpu_experts, self._gpu_layer_slot_map = self._build_layer_slot_mapping(self._gpu_cache_capacity)
 
         # ---- 预分配 GPU / CPU 连续 buffer：[num_slots, expert_elems] ----
         if self._num_cpu_experts > 0:
@@ -107,6 +112,27 @@ class ExpertCacheManager:
     # ==================================================================
     # 公开接口
     # ==================================================================
+
+    def _resolve_routed_expert_layers(self) -> list[int]:
+        """从 adapter 获取真实包含 routed experts 的层。"""
+
+        if self.model_config is not None and hasattr(self.adapter, "routed_expert_layers"):
+            return list(self.adapter.routed_expert_layers(self.model_config))
+
+        raise RuntimeError("ExpertCacheManager 需要 model_config 和 adapter.routed_expert_layers() 来确定专家层。")
+
+    def _filter_cache_capacity(self, cap: dict[int, int] | None) -> dict[int, int]:
+        """只保留 routed expert layer 的缓存容量配置。"""
+
+        if not cap:
+            return {}
+
+        routed_layers = set(self._routed_expert_layers)
+        return {
+            layer_idx: count
+            for layer_idx, count in cap.items()
+            if layer_idx in routed_layers and count > 0
+        }
 
     def step(self) -> None:
         """每个 forward pass 结束后调用，递增全局 step。
@@ -298,10 +324,18 @@ class ExpertCacheManager:
     def _probe_expert(self) -> tuple[int, dict[str, list[int, int], torch.dtype]]:
         """通过 adapter + tensor_loader 探测单个专家的总元素数和张量切分布局。
 
-        以 layer 0, expert 0 采样（所有 MoE 层专家结构一致）。
         adapter 负责提供张量名，tensor_loader 负责提供 shape / dtype。
         """
-        spec = self.adapter.routed_expert_weight_name(1, 0)
+        spec = None
+        for layer_idx in self._routed_expert_layers:
+            candidate = self.adapter.routed_expert_weight_name(layer_idx, 0)
+            if all(self.loader.has_tensor(tensor_name=name) for name in candidate.values()):
+                spec = candidate
+                break
+
+        if spec is None:
+            raise KeyError("No routed expert tensor found in manifest for expert probing.")
+
         role_names = list(spec.keys())
         tensor_names = list(spec.values())
         
@@ -331,7 +365,3 @@ class ExpertCacheManager:
             offset += count
         # 专家数量 = 层数，直接返回
         return offset, layer_slot_map
-
-
-
-

@@ -61,6 +61,10 @@ class MoeModelAdapter(ABC):
         """返回某层某个 expert 所需的 tensor_name 映射。"""
 
     @abstractmethod
+    def routed_expert_layers(self, model_config: Any) -> list[int]:
+        """返回包含 routed experts 的 transformer layer 索引。"""
+
+    @abstractmethod
     def patch_moe_block(self, model: nn.Module) -> nn.Module:
         """将原始 MoE block替换"""
 

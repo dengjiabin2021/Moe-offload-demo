@@ -74,6 +74,12 @@ class Qwen15MoeAdapter(MoeModelAdapter):
         # 用通用 ExpertWeightSpec 表达，后续 ModelRuntime/ExpertRuntime 不需要硬编码 Qwen 命名。
         return idxs_to_name
     
+    def routed_expert_layers(self, model_config: Qwen2MoeConfig) -> list[int]:
+        """返回 Qwen MoE 中包含 routed experts 的 decoder layer 索引。"""
+
+        sparse_step = getattr(model_config, "decoder_sparse_step", 1)
+        return list(range(0, model_config.num_hidden_layers, sparse_step))
+
     def patch_moe_block(
         self,
         model: nn.Module,
