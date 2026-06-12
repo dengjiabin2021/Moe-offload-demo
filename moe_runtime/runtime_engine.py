@@ -6,7 +6,7 @@ from typing import Any
 from transformers import AutoConfig
 
 from moe_runtime.adapters import auto_select_adapter
-from moe_runtime.cache_manager.cache_manager import ExpertCacheManager
+from moe_runtime.cache_manager.sync_cache_manager import ExpertCacheManager
 from moe_runtime.config import RuntimeConfig
 from moe_runtime.loader import ManifestTensorLoader
 from moe_runtime.runtime.model_runtime import ModelRuntime
