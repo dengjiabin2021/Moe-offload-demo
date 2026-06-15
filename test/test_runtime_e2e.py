@@ -44,14 +44,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gpu-cache-per-layer",
         type=int,
-        default=8,
-        help="GPU 每层缓存专家数，默认 8。",
+        default=4,
+        help="GPU 每层缓存专家数，默认 4。",
     )
     parser.add_argument(
         "--cpu-cache-per-layer",
         type=int,
-        default=12,
-        help="CPU 每层缓存专家数，默认 12。",
+        default=8,
+        help="CPU 每层缓存专家数，默认 8。",
     )
     return parser.parse_args()
 

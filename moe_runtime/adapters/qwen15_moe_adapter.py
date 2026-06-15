@@ -20,7 +20,7 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
 # 引入 Adapter 基类和结构化返回类型。
 from .base import MoeModelAdapter
-from moe_runtime.blocks.qwen2_moe_block import Qwen2OnDemandExperts
+from moe_runtime.blocks.sync_qwen2_moe_block import Qwen2OnDemandExperts
 
 
 class Qwen15MoeAdapter(MoeModelAdapter):
