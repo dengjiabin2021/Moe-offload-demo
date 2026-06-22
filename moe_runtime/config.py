@@ -32,6 +32,9 @@ class RuntimeConfig:
     # 缓存策略。
     cache_policy: str = "none"
 
+    # CacheManager 实现模式：serial 使用串行加载；async 使用异步加载。
+    cache_manager_mode: str = "async"
+
     # 预取策略。
     prefetch_policy: str = "none"
 

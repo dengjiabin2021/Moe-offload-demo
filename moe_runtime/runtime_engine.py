@@ -6,7 +6,7 @@ from typing import Any
 from transformers import AutoConfig
 
 from moe_runtime.adapters import auto_select_adapter
-from moe_runtime.cache_manager.sync_cache_manager import ExpertCacheManager
+from moe_runtime.cache_manager import ExpertCacheManager, asyncExpertCacheManager
 from moe_runtime.config import RuntimeConfig
 from moe_runtime.loader import ManifestTensorLoader
 from moe_runtime.runtime.model_runtime import ModelRuntime
@@ -62,9 +62,9 @@ class MoeRuntimeEngine:
         # 3. 根据 model_type 自动选择对应 Adapter。
         self.adapter = auto_select_adapter(self.config.model_dir, self.model_config)
 
-        # 4. 如果配置了缓存容量（GPU 或 CPU），创建 ExpertCacheManager。
-
-        self.cache_manager = ExpertCacheManager(
+        # 4. 创建 ExpertCacheManager。串行/异步由 RuntimeConfig.cache_manager_mode 统一决定。
+        cache_manager_cls = self._select_cache_manager_cls()
+        self.cache_manager = cache_manager_cls(
             runtime_config=self.config,
             adapter=self.adapter,
             tensor_loader=self.tensor_loader,
@@ -93,3 +93,19 @@ class MoeRuntimeEngine:
             raise RuntimeError("请先调用 load_model() 加载模型。")
 
         return self.model_runtime.generate(*args, **kwargs)
+
+    def _select_cache_manager_cls(self) -> type:
+        """根据 RuntimeConfig.cache_manager_mode 选择串行或异步 CacheManager。"""
+
+        cache_manager_mode = self.config.cache_manager_mode
+
+        if cache_manager_mode == "serial":
+            return ExpertCacheManager
+
+        if cache_manager_mode == 'async':
+            return asyncExpertCacheManager
+
+        raise ValueError(
+            f"Unsupported cache_manager_mode: {cache_manager_mode}. "
+            "Expected 'serial', 'async'."
+        )

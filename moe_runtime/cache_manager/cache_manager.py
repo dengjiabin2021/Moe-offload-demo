@@ -59,9 +59,12 @@ class ExpertCacheManager:
         self.model_config = model_config
         self._cpu_device = "cpu"
         self._gpu_device = "cuda"
+        self._is_cuda_target = self._gpu_device.startswith("cuda") and torch.cuda.is_available()
+        
         self._routed_expert_layers = self._resolve_routed_expert_layers()
         self._cpu_cache_capacity = self._filter_cache_capacity(self.config.max_cpu_cache_capacity)
         self._gpu_cache_capacity = self._filter_cache_capacity(self.config.max_gpu_cache_capacity)
+        self._validate_cache_capacity()
 
         self._global_step = 0
         self._expert_elems: int = 0
@@ -88,6 +91,7 @@ class ExpertCacheManager:
                 self._expert_elems,
                 dtype=self._expert_dtype,
                 device=self._cpu_device,
+                pin_memory=self._is_cuda_target
             )
 
         if self._num_gpu_experts > 0:
@@ -320,6 +324,29 @@ class ExpertCacheManager:
     # ==================================================================
     # 初始化：
     # ==================================================================
+    def _validate_cache_capacity(self) -> None:
+        """检查每个 routed expert 层是否都有 CPU/GPU slot。
+
+        异步 block 会在每个 routed expert 层请求专家。
+        如果某一层缺 CPU 或 GPU slot，调度器无法推进，必须初始化阶段直接报错。
+        """
+
+        missing_cpu = [
+            layer_idx
+            for layer_idx in self._routed_expert_layers
+            if self._cpu_cache_capacity.get(layer_idx, 0) <= 0
+        ]
+        missing_gpu = [
+            layer_idx
+            for layer_idx in self._routed_expert_layers
+            if self._gpu_cache_capacity.get(layer_idx, 0) <= 0
+        ]
+
+        if missing_cpu:
+            raise ValueError(f"CPU cache capacity is missing for routed expert layers: {missing_cpu}")
+        if missing_gpu:
+            raise ValueError(f"GPU cache capacity is missing for routed expert layers: {missing_gpu}")
+
 
     def _probe_expert(self) -> tuple[int, dict[str, list[int, int], torch.dtype]]:
         """通过 adapter + tensor_loader 探测单个专家的总元素数和张量切分布局。

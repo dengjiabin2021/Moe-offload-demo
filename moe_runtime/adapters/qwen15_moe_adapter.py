@@ -20,7 +20,8 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
 # 引入 Adapter 基类和结构化返回类型。
 from .base import MoeModelAdapter
-from moe_runtime.blocks.sync_qwen2_moe_block import Qwen2OnDemandExperts
+from moe_runtime.blocks import Qwen2OnDemandExperts
+from moe_runtime.blocks import asyncQwen2OnDemandExperts
 
 
 class Qwen15MoeAdapter(MoeModelAdapter):
@@ -92,6 +93,13 @@ class Qwen15MoeAdapter(MoeModelAdapter):
         # Qwen2MoeForCausalLM 的 decoder layers 通常位于 model.model.layers。
         layers = model.model.layers
 
+        # 串行/异步体系共用同一个 adapter；根据 CacheManager 暴露的接口选择专家模块。
+        expert_cls = (
+            asyncQwen2OnDemandExperts
+            if self._use_sync_experts(cache_manager)
+            else Qwen2OnDemandExperts
+        )
+
         # 遍历每一层 decoder layer，只处理包含 sparse MoE experts 的层。
         for layer_idx, layer in enumerate(layers):
             mlp = getattr(layer, "mlp", None)
@@ -101,7 +109,7 @@ class Qwen15MoeAdapter(MoeModelAdapter):
                 continue
 
             # 保留 gate/shared_expert/shared_expert_gate，只把 routed experts 替换为按需加载版本。
-            mlp.experts = Qwen2OnDemandExperts(
+            mlp.experts = expert_cls(
                 model_config,
                 layer_idx=layer_idx,
                 cache_manager=cache_manager,
@@ -109,6 +117,23 @@ class Qwen15MoeAdapter(MoeModelAdapter):
             )
 
         return model
+
+    @staticmethod
+    def _use_sync_experts(cache_manager: Any | None) -> bool:
+        """判断当前 CacheManager 是否使用异步 expert ready/release 接口。"""
+
+        if cache_manager is None:
+            return False
+
+        # 不绑定具体类名，后续新的异步 CacheManager 只要实现同一组接口即可复用。
+        required_methods = (
+            "request_expert",
+            "is_expert_ready",
+            "wait_any_ready",
+            "get_ready_expert",
+            "release_expert",
+        )
+        return all(hasattr(cache_manager, name) for name in required_methods)
 
     def materialize_meta_tensors(self, model: nn.Module, target_device: torch.device) -> None:
         """Qwen MoE 专用：重算 RoPE inv_freq 并 materialize 残留 meta tensor。"""

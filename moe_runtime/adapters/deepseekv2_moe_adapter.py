@@ -16,7 +16,8 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
 # 引入 Adapter 基类。
 from .base import MoeModelAdapter
-from moe_runtime.blocks.deepseekv2_moe_block import DeepseekV2OnDemandExperts
+from moe_runtime.blocks import DeepseekV2OnDemandExperts
+from moe_runtime.blocks import asyncDeepseekV2OnDemandExperts
 
 
 class DeepseekV2MoeAdapter(MoeModelAdapter):
@@ -97,6 +98,13 @@ class DeepseekV2MoeAdapter(MoeModelAdapter):
         # DeepseekV2ForCausalLM 的 decoder layers 通常位于 model.model.layers。
         layers = model.model.layers
 
+        # 串行/异步体系共用同一个 adapter；根据 CacheManager 暴露的接口选择专家模块。
+        expert_cls = (
+            asyncDeepseekV2OnDemandExperts
+            if self._use_sync_experts(cache_manager)
+            else DeepseekV2OnDemandExperts
+        )
+
         # 第 0 层通常是 dense MLP；只有带 experts 字段的 MoE 层需要替换。
         for layer_idx, layer in enumerate(layers):
             mlp = getattr(layer, "mlp", None)
@@ -105,7 +113,7 @@ class DeepseekV2MoeAdapter(MoeModelAdapter):
                 continue
 
             # 保留 gate/shared_experts，只把 routed experts 替换为后续实现的按需加载模块。
-            mlp.experts = DeepseekV2OnDemandExperts(
+            mlp.experts = expert_cls(
                 model_config,
                 layer_idx=layer_idx,
                 cache_manager=cache_manager,
@@ -113,6 +121,23 @@ class DeepseekV2MoeAdapter(MoeModelAdapter):
             )
 
         return model
+
+    @staticmethod
+    def _use_sync_experts(cache_manager: Any | None) -> bool:
+        """判断当前 CacheManager 是否使用异步 expert ready/release 接口。"""
+
+        if cache_manager is None:
+            return False
+
+        # 不绑定具体类名，后续新的异步 CacheManager 只要实现同一组接口即可复用。
+        required_methods = (
+            "request_expert",
+            "is_expert_ready",
+            "wait_any_ready",
+            "get_ready_expert",
+            "release_expert",
+        )
+        return all(hasattr(cache_manager, name) for name in required_methods)
 
     def materialize_meta_tensors(self, model: nn.Module, target_device: torch.device) -> None:
         """DeepSeek-V2 专用：重算 RoPE inv_freq 并 materialize 残留 meta buffer。"""
@@ -132,9 +157,6 @@ class DeepseekV2MoeAdapter(MoeModelAdapter):
 
         config = module.config
         rope_type = config.rope_parameters["rope_type"]
-        print("----------------------")
-        print(rope_type)
-        print("----------------------")
         if rope_type == "default":
             base = config.rope_parameters["rope_theta"]
             dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads

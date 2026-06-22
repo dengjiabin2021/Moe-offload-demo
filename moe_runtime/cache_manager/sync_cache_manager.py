@@ -84,7 +84,7 @@ class _ExpertRequest:
     error: BaseException | None = None
 
 
-class ExpertCacheManager:
+class asyncExpertCacheManager:
     """异步 routed expert 缓存管理器。
 
     设计边界：
@@ -158,7 +158,7 @@ class ExpertCacheManager:
             self._expert_elems,
             dtype=self._expert_dtype,
             device=self._cpu_device,
-            pin_memory=self._is_cuda_target,
+            pin_memory=self._is_cuda_target
         )
 
         # GPU buffer 是 block 计算时直接读取的专家权重池。
@@ -225,13 +225,13 @@ class ExpertCacheManager:
         - CPU/GPU 都未命中：加入 waiting_cpu，等待磁盘回源。
         """
 
-        key = (layer_idx, int(expert_idx))
+        key = (layer_idx, expert_idx)
         with self._cv:
-            self._raise_if_error_locked(key)
+            self._raise_if_error(key)
 
             # 已经有同一个 expert 的请求时，不重复入队；后台调度器会继续推进原请求。
             if key not in self._requests:
-                self._enqueue_request_locked(key)
+                self._enqueue_request(key)
 
             self._cv.notify_all()
 
@@ -242,9 +242,9 @@ class ExpertCacheManager:
         protected 并标记 ready，避免 block 准备计算时被后台 LRU 覆盖。
         """
 
-        key = (layer_idx, int(expert_idx))
+        key = (layer_idx, expert_idx)
         with self._cv:
-            self._raise_if_error_locked(key)
+            self._raise_if_error(key)
 
             # 已经 ready 的 expert 可以直接交给 block 计算。
             if key in self._ready:
@@ -264,7 +264,18 @@ class ExpertCacheManager:
             if gpu_slot_idx is None:
                 return False
 
-            self._mark_gpu_hit_ready_locked(key, gpu_slot_idx)
+            gpu_slot = self._gpu_slots[gpu_slot_idx]
+            # ready expert 必须 protected，避免 block 计算前或计算中被 LRU 覆盖。
+            gpu_slot.status = "protected"
+            self._requests[key] = _ExpertRequest(
+                layer_idx=key[0],
+                expert_idx=key[1],
+                stage="ready",
+                gpu_slot_idx=gpu_slot_idx,
+                gpu_generation=gpu_slot.generation,
+            )
+            self._ready.add(key)
+
             self._cv.notify_all()
             return True
 
@@ -272,33 +283,30 @@ class ExpertCacheManager:
         """阻塞等待一组 expert 中任意一个变为 ready。
 
         block 只有在当前没有 ready expert、但仍有 pending expert 时才调用它。
-        后台调度线程仍然独立运行，本函数只等待条件变量通知。
+        所有 pending expert 都必须已经通过 request_expert 进入调度状态机。
+        本函数不修复丢失的 request；如果状态机不一致，直接报错，方便定位问题。
         """
 
         if not expert_ids:
             raise ValueError("wait_any_ready requires at least one expert id.")
 
-        keys = [(layer_idx, int(expert_idx)) for expert_idx in expert_ids]
+        keys = [(layer_idx, expert_idx) for expert_idx in expert_ids]
         with self._cv:
-            # 确保所有 pending expert 都已经进入 CacheManager 调度队列。
+            # pending expert 必须已经由 block 调用 request_expert 提交过。
             for key in keys:
                 if key not in self._ready and key not in self._requests:
-                    self._enqueue_request_locked(key)
-            self._cv.notify_all()
+                    raise RuntimeError(f"Pending expert has not been requested: {key}")
 
             while True:
                 for key in keys:
-                    self._raise_if_error_locked(key)
+                    self._raise_if_error(key)
 
-                    # 任意一个 expert ready 后立即返回，由 block 取权重并计算。
+                    # 任意一个 expert ready 后立即返回，由 block 获取权重并提交计算。
                     if key in self._ready:
                         return key[1]
 
-                    # 如果同一个 expert 上一轮处于 compute_pending，后台确认计算完成后会删除旧 request。
-                    # 等待方发现 request 消失，就重新入队；此时通常会命中 GPU used slot 并变成 ready。
                     if key not in self._requests:
-                        self._enqueue_request_locked(key)
-                        self._cv.notify_all()
+                        raise RuntimeError(f"Pending expert request disappeared before ready: {key}")
 
                 self._cv.wait(timeout=_WAIT_READY_SECONDS)
 
@@ -309,9 +317,9 @@ class ExpertCacheManager:
         返回值是对 _gpu_buffer 对应行的 view，不会产生额外权重拷贝。
         """
 
-        key = (layer_idx, int(expert_idx))
+        key = (layer_idx, expert_idx)
         with self._lock:
-            self._raise_if_error_locked(key)
+            self._raise_if_error(key)
             req = self._requests.get(key)
             if req is None or key not in self._ready or req.gpu_slot_idx is None:
                 raise RuntimeError(f"Expert is not ready: layer={layer_idx}, expert={expert_idx}")
@@ -319,15 +327,8 @@ class ExpertCacheManager:
             slot = self._gpu_slots[req.gpu_slot_idx]
 
             # generation 校验可以避免异步事件落后时读到已经被覆盖的 slot。
-            if (
-                slot.status != "protected"
-                or slot.layer_idx != key[0]
-                or slot.expert_idx != key[1]
-                or slot.generation != req.gpu_generation
-            ):
-                raise RuntimeError(
-                    f"Ready expert slot state is invalid: layer={layer_idx}, expert={expert_idx}"
-                )
+            if (slot.status != "protected" or slot.layer_idx != key[0] or slot.expert_idx != key[1] or slot.generation != req.gpu_generation):
+                raise RuntimeError(f"Ready expert slot state is invalid: layer={layer_idx}, expert={expert_idx}")
 
             return self._view_gpu_slot(req.gpu_slot_idx)
 
@@ -338,13 +339,14 @@ class ExpertCacheManager:
         CUDA 目标设备上会记录当前 stream 的 event，后台调度器等 event 完成后才允许该 slot 被 LRU 覆盖。
         """
 
-        key = (layer_idx, int(expert_idx))
+        key = (layer_idx, expert_idx)
         with self._cv:
             req = self._requests.get(key)
             if req is None:
                 raise RuntimeError(f"Cannot release unknown expert: layer={layer_idx}, expert={expert_idx}")
 
-            self._raise_if_error_locked(key)
+            self._raise_if_error(key)
+
             if key not in self._ready or req.gpu_slot_idx is None:
                 raise RuntimeError(f"Cannot release non-ready expert: layer={layer_idx}, expert={expert_idx}")
 
@@ -380,11 +382,11 @@ class ExpertCacheManager:
                 if self._shutdown:
                     return
 
-                progressed = self._pump_locked()
+                progressed = self._pump()
                 if not progressed:
                     self._cv.wait(timeout=_SCHEDULER_WAIT_SECONDS)
 
-    def _pump_locked(self) -> bool:
+    def _pump(self) -> bool:
         """执行一次非阻塞调度 tick。
 
         调用方必须持有 self._cv。
@@ -416,27 +418,38 @@ class ExpertCacheManager:
         """检查哪些 GPU 计算已经完成，并释放对应 protected slot。
 
         状态流转：protected + compute_pending -> used。
+        compute_pending 中的每个 key 都必须有完整 request 和 GPU slot 信息。
         """
 
         progressed = False
         for key in list(self._compute_pending):
             req = self._requests.get(key)
             if req is None:
-                self._compute_pending.discard(key)
-                progressed = True
-                continue
+                raise RuntimeError(f"Compute pending expert has no request: {key}")
+
+            if req.stage != "compute_pending":
+                raise RuntimeError(f"Compute pending expert has invalid stage: {key}, stage={req.stage}")
+
+            if req.gpu_slot_idx is None:
+                raise RuntimeError(f"Compute pending expert has no GPU slot: {key}")
 
             # CUDA event 未完成时，slot 仍然 protected，不能被覆盖。
             if req.compute_event is not None and not req.compute_event.query():
                 continue
 
-            if req.gpu_slot_idx is not None:
-                slot = self._gpu_slots[req.gpu_slot_idx]
+            slot = self._gpu_slots[req.gpu_slot_idx]
 
-                # generation 匹配才说明这个 event 对应的仍是当前 slot 内容。
-                if slot.generation == req.gpu_generation and slot.status == "protected":
-                    slot.status = "used"
-                    slot.last_used_step = self._global_step
+            # 计算完成后，slot 必须仍然是同一个 protected expert；否则说明 slot 被错误覆盖。
+            if (
+                slot.generation != req.gpu_generation
+                or slot.status != "protected"
+                or slot.layer_idx != req.layer_idx
+                or slot.expert_idx != req.expert_idx
+            ):
+                raise RuntimeError(f"Compute pending expert slot state is invalid: {key}")
+
+            slot.status = "used"
+            slot.last_used_step = self._global_step
 
             self._compute_pending.discard(key)
             self._requests.pop(key, None)
@@ -450,31 +463,46 @@ class ExpertCacheManager:
         状态流转：
         - GPU: loading -> protected
         - CPU: protected -> used
+        loading_gpu 中的 request 必须同时持有源 CPU slot 和目标 GPU slot。
         """
 
         progressed = False
         for key in list(self._loading_gpu):
             req = self._requests.get(key)
             if req is None:
-                self._loading_gpu.discard(key)
-                progressed = True
-                continue
+                raise RuntimeError(f"Loading GPU expert has no request: {key}")
+
+            if req.stage != "loading_gpu":
+                raise RuntimeError(f"Loading GPU expert has invalid stage: {key}, stage={req.stage}")
 
             # CUDA H2D event 未完成时，GPU slot 仍处于 loading，block 不能读取。
             if req.h2d_event is not None and not req.h2d_event.query():
                 continue
 
             if req.gpu_slot_idx is None:
-                self._loading_gpu.discard(key)
-                progressed = True
-                continue
+                raise RuntimeError(f"Loading GPU expert has no GPU slot: {key}")
+
+            if req.cpu_slot_idx is None:
+                raise RuntimeError(f"Loading GPU expert has no CPU source slot: {key}")
 
             gpu_slot = self._gpu_slots[req.gpu_slot_idx]
-            if gpu_slot.generation != req.gpu_generation:
-                req.error = RuntimeError(f"Stale GPU slot generation for expert {key}")
-                self._loading_gpu.discard(key)
-                progressed = True
-                continue
+            if (
+                gpu_slot.generation != req.gpu_generation
+                or gpu_slot.status != "loading"
+                or gpu_slot.layer_idx != req.layer_idx
+                or gpu_slot.expert_idx != req.expert_idx
+            ):
+                raise RuntimeError(f"Loading GPU expert slot state is invalid: {key}")
+
+            # 先确认 CPU 源 slot 仍然是同一个 protected expert，再提交 GPU ready 状态。
+            cpu_slot = self._cpu_slots[req.cpu_slot_idx]
+            if (
+                cpu_slot.generation != req.cpu_generation
+                or cpu_slot.status != "protected"
+                or cpu_slot.layer_idx != req.layer_idx
+                or cpu_slot.expert_idx != req.expert_idx
+            ):
+                raise RuntimeError(f"Loading GPU expert CPU source slot state is invalid: {key}")
 
             # H2D 完成后直接 protected，因为这个 expert 是当前 block 正在等待计算的。
             gpu_slot.status = "protected"
@@ -483,11 +511,8 @@ class ExpertCacheManager:
             self._ready.add(key)
 
             # CPU 源 slot 不再被 H2D 使用，可以重新变为 used，后续允许 LRU 覆盖。
-            if req.cpu_slot_idx is not None:
-                cpu_slot = self._cpu_slots[req.cpu_slot_idx]
-                if cpu_slot.generation == req.cpu_generation and cpu_slot.status == "protected":
-                    cpu_slot.status = "used"
-                    cpu_slot.last_used_step = self._global_step
+            cpu_slot.status = "used"
+            cpu_slot.last_used_step = self._global_step
 
             progressed = True
 
@@ -498,39 +523,41 @@ class ExpertCacheManager:
 
         状态流转：CPU loading -> protected -> waiting_gpu。
         CPU slot 转 protected 是为了保证随后的 H2D 拷贝不会被 CPU LRU 覆盖。
+        loading_cpu 中的 request 必须持有磁盘 future 和目标 CPU slot。
         """
 
         progressed = False
         for key in list(self._loading_cpu):
             req = self._requests.get(key)
             if req is None:
-                self._loading_cpu.discard(key)
-                progressed = True
-                continue
+                raise RuntimeError(f"Loading CPU expert has no request: {key}")
+
+            if req.stage != "loading_cpu":
+                raise RuntimeError(f"Loading CPU expert has invalid stage: {key}, stage={req.stage}")
+
+            if req.disk_future is None:
+                raise RuntimeError(f"Loading CPU expert has no disk future: {key}")
 
             # 磁盘线程尚未完成，不能读取或移动 CPU slot。
-            if req.disk_future is None or not req.disk_future.done():
+            if not req.disk_future.done():
                 continue
 
             try:
                 req.disk_future.result()
             except BaseException as exc:
-                req.error = exc
-                self._loading_cpu.discard(key)
-                progressed = True
-                continue
+                raise RuntimeError(f"Disk read failed for expert {key}") from exc
 
             if req.cpu_slot_idx is None:
-                self._loading_cpu.discard(key)
-                progressed = True
-                continue
+                raise RuntimeError(f"Loading CPU expert has no CPU slot: {key}")
 
             cpu_slot = self._cpu_slots[req.cpu_slot_idx]
-            if cpu_slot.generation != req.cpu_generation:
-                req.error = RuntimeError(f"Stale CPU slot generation for expert {key}")
-                self._loading_cpu.discard(key)
-                progressed = True
-                continue
+            if (
+                cpu_slot.generation != req.cpu_generation
+                or cpu_slot.status != "loading"
+                or cpu_slot.layer_idx != req.layer_idx
+                or cpu_slot.expert_idx != req.expert_idx
+            ):
+                raise RuntimeError(f"Loading CPU expert slot state is invalid: {key}")
 
             # 磁盘已经写完整个 expert，CPU slot 可读但暂时不可覆盖，等待 H2D。
             cpu_slot.status = "protected"
@@ -546,6 +573,7 @@ class ExpertCacheManager:
 
         如果 GPU 没有 free/used slot，函数立即返回，不阻塞。
         后续等 block release 或计算 event 完成后，后台线程会再次尝试。
+        waiting_gpu 队列只允许保存 stage 为 waiting_gpu 且 CPU slot 已经 protected 的请求。
         """
 
         progressed = False
@@ -553,19 +581,23 @@ class ExpertCacheManager:
             key = self._waiting_gpu[0]
             req = self._requests.get(key)
 
-            # 队列里可能残留已经完成或失败的旧 key，直接清掉。
-            if req is None or req.stage != "waiting_gpu":
-                self._waiting_gpu.popleft()
-                progressed = True
-                continue
+            if req is None:
+                raise RuntimeError(f"Waiting GPU expert has no request: {key}")
 
-            # 没有 CPU slot 说明还需要回源，转回 waiting_cpu。
+            if req.stage != "waiting_gpu":
+                raise RuntimeError(f"Waiting GPU expert has invalid stage: {key}, stage={req.stage}")
+
             if req.cpu_slot_idx is None:
-                self._waiting_gpu.popleft()
-                req.stage = "waiting_cpu"
-                self._waiting_cpu.append(key)
-                progressed = True
-                continue
+                raise RuntimeError(f"Waiting GPU expert has no CPU source slot: {key}")
+
+            cpu_slot = self._cpu_slots[req.cpu_slot_idx]
+            if (
+                cpu_slot.generation != req.cpu_generation
+                or cpu_slot.status != "protected"
+                or cpu_slot.layer_idx != req.layer_idx
+                or cpu_slot.expert_idx != req.expert_idx
+            ):
+                raise RuntimeError(f"Waiting GPU expert CPU source slot state is invalid: {key}")
 
             gpu_slot_idx = self._pick_slot(self._gpu_slots, self._gpu_layer_slot_map, req.layer_idx)
             if gpu_slot_idx is None:
@@ -609,6 +641,7 @@ class ExpertCacheManager:
 
         磁盘读取由 ThreadPoolExecutor 执行，因此不会阻塞后台调度线程。
         同时最多允许 _MAX_DISK_WORKERS 个 expert 正在回源，避免无界并发抢占内存带宽。
+        waiting_cpu 队列只允许保存 stage 为 waiting_cpu、且尚未占用 CPU slot 的请求。
         """
 
         progressed = False
@@ -616,11 +649,14 @@ class ExpertCacheManager:
             key = self._waiting_cpu[0]
             req = self._requests.get(key)
 
-            # 清理队列里已经不再处于 waiting_cpu 的旧 key。
-            if req is None or req.stage != "waiting_cpu":
-                self._waiting_cpu.popleft()
-                progressed = True
-                continue
+            if req is None:
+                raise RuntimeError(f"Waiting CPU expert has no request: {key}")
+
+            if req.stage != "waiting_cpu":
+                raise RuntimeError(f"Waiting CPU expert has invalid stage: {key}, stage={req.stage}")
+
+            if req.cpu_slot_idx is not None:
+                raise RuntimeError(f"Waiting CPU expert already has CPU slot: {key}")
 
             cpu_slot_idx = self._pick_slot(self._cpu_slots, self._cpu_layer_slot_map, req.layer_idx)
             if cpu_slot_idx is None:
@@ -651,11 +687,7 @@ class ExpertCacheManager:
 
         return progressed
 
-    # ==================================================================
-    # request 和 slot 辅助函数
-    # ==================================================================
-
-    def _enqueue_request_locked(self, key: ExpertKey) -> None:
+    def _enqueue_request(self, key: ExpertKey) -> None:
         """按 GPU hit、CPU hit、disk miss 的顺序把请求放入调度系统。
 
         调用方必须持有 self._cv。
@@ -664,8 +696,6 @@ class ExpertCacheManager:
         if key in self._requests:
             return
 
-        self._validate_request_layer_locked(key[0])
-
         # GPU used/protected 命中时不搬运，直接 protected 并 ready。
         gpu_slot_idx = self._find_expert_in_slots(
             self._gpu_slots,
@@ -673,8 +703,19 @@ class ExpertCacheManager:
             key[0],
             key[1],
         )
+
         if gpu_slot_idx is not None:
-            self._mark_gpu_hit_ready_locked(key, gpu_slot_idx)
+            gpu_slot = self._gpu_slots[gpu_slot_idx]
+            # ready expert 必须 protected，避免 block 计算前或计算中被 LRU 覆盖。
+            gpu_slot.status = "protected"
+            self._requests[key] = _ExpertRequest(
+                layer_idx=key[0],
+                expert_idx=key[1],
+                stage="ready",
+                gpu_slot_idx=gpu_slot_idx,
+                gpu_generation=gpu_slot.generation,
+            )
+            self._ready.add(key)
             return
 
         # CPU 命中时先保护 CPU slot，随后等待后台调度 H2D。
@@ -684,6 +725,7 @@ class ExpertCacheManager:
             key[0],
             key[1],
         )
+
         if cpu_slot_idx is not None:
             cpu_slot = self._cpu_slots[cpu_slot_idx]
             cpu_slot.status = "protected"
@@ -705,28 +747,10 @@ class ExpertCacheManager:
         )
         self._waiting_cpu.append(key)
 
-    def _mark_gpu_hit_ready_locked(self, key: ExpertKey, gpu_slot_idx: int) -> None:
-        """把一个 GPU 命中的 used/protected slot 标记为当前请求 ready。"""
+    # ==================================================================
+    # request 和 slot 辅助函数
+    # ==================================================================
 
-        gpu_slot = self._gpu_slots[gpu_slot_idx]
-
-        # ready expert 必须 protected，避免 block 计算前或计算中被 LRU 覆盖。
-        gpu_slot.status = "protected"
-        self._requests[key] = _ExpertRequest(
-            layer_idx=key[0],
-            expert_idx=key[1],
-            stage="ready",
-            gpu_slot_idx=gpu_slot_idx,
-            gpu_generation=gpu_slot.generation,
-        )
-        self._ready.add(key)
-
-    def _raise_if_error_locked(self, key: ExpertKey) -> None:
-        """如果某个异步任务失败，将后台异常重新抛给 block。"""
-
-        req = self._requests.get(key)
-        if req is not None and req.error is not None:
-            raise RuntimeError(f"Expert request failed for {key}") from req.error
 
     @staticmethod
     def _find_expert_in_slots(
@@ -808,6 +832,13 @@ class ExpertCacheManager:
 
         return free_idx if free_idx is not None else used_idx
 
+    def _raise_if_error(self, key: ExpertKey) -> None:
+        """如果某个异步任务失败，将后台异常重新抛给 block。"""
+
+        req = self._requests.get(key)
+        if req is not None and req.error is not None:
+            raise RuntimeError(f"Expert request failed for {key}") from req.error
+
     # ==================================================================
     # 初始化辅助函数
     # ==================================================================
@@ -855,14 +886,6 @@ class ExpertCacheManager:
             raise ValueError(f"CPU cache capacity is missing for routed expert layers: {missing_cpu}")
         if missing_gpu:
             raise ValueError(f"GPU cache capacity is missing for routed expert layers: {missing_gpu}")
-
-    def _validate_request_layer_locked(self, layer_idx: int) -> None:
-        """确认请求层已经配置了 CPU/GPU 缓存 slot。"""
-
-        if layer_idx not in self._cpu_layer_slot_map:
-            raise RuntimeError(f"No CPU cache slots configured for routed expert layer {layer_idx}.")
-        if layer_idx not in self._gpu_layer_slot_map:
-            raise RuntimeError(f"No GPU cache slots configured for routed expert layer {layer_idx}.")
 
     def _probe_expert(self) -> tuple[int, dict[str, list[int]], torch.dtype]:
         """探测单个 routed expert 的展平大小、布局和 dtype。
