@@ -57,6 +57,7 @@ class ExpertCacheManager:
         self.adapter = adapter
         self.loader = tensor_loader
         self.model_config = model_config
+        self._closed = False
         self._cpu_device = "cpu"
         self._gpu_device = "cuda"
         self._is_cuda_target = self._gpu_device.startswith("cuda") and torch.cuda.is_available()
@@ -392,3 +393,27 @@ class ExpertCacheManager:
             offset += count
         # 专家数量 = 层数，直接返回
         return offset, layer_slot_map
+
+    def close(self) -> None:
+        """释放串行 CacheManager 持有的大块 CPU/GPU buffer。
+
+        串行 CacheManager 没有后台线程，但仍然持有 pinned CPU buffer 和 GPU buffer。
+        benchmark 连续创建多套 runtime 时，显式断开这些引用可以更快归还内存。
+        """
+
+        if self._closed:
+            return
+
+        self._closed = True
+        self._cpu_buffer = None
+        self._gpu_buffer = None
+        self._cpu_slots.clear()
+        self._gpu_slots.clear()
+
+    def __del__(self) -> None:
+        """对象析构时尽量释放 cache buffer。"""
+
+        try:
+            self.close()
+        except Exception:
+            pass

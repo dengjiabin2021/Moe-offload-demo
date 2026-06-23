@@ -19,7 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 import moe_runtime.adapters.qwen15_moe_adapter as qwen_adapter_module
 import moe_runtime.runtime_engine as runtime_engine_module
 from moe_runtime.blocks.qwen2_moe_block import Qwen2OnDemandExperts as SerialQwen2OnDemandExperts
-from moe_runtime.blocks.sync_qwen2_moe_block import Qwen2OnDemandExperts as AsyncQwen2OnDemandExperts
+from moe_runtime.blocks.async_qwen2_moe_block import Qwen2OnDemandExperts as AsyncQwen2OnDemandExperts
 from moe_runtime.cache_manager.cache_manager import ExpertCacheManager as SerialExpertCacheManager
 from moe_runtime.cache_manager.sync_cache_manager import ExpertCacheManager as AsyncExpertCacheManager
 from moe_runtime.config import RuntimeConfig

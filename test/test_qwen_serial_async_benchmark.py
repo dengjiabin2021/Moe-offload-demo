@@ -20,10 +20,11 @@ from moe_runtime import MoeRuntimeEngine, RuntimeConfig
 MODEL_DIR = PROJECT_ROOT / "models" / "Qwen1.5-Moe-A2.7B"
 DEVICE = "cuda"
 MAX_NEW_TOKENS = 32
-GPU_CACHE_PER_LAYER = 6
+GPU_CACHE_PER_LAYER = 4
 CPU_CACHE_PER_LAYER = 8
 PROMPT = "问：你好 答：你好！有什么我可以帮你的吗? 问: 1+1=? 答："
 CLEANUP_WAIT_SECONDS = 5
+TRACE_ROUTER = False
 
 
 def sync_cuda() -> None:
@@ -154,7 +155,7 @@ def run(mode: str, tokenizer: AutoTokenizer, gpu_cache: dict[int, int], cpu_cach
         engine.build_components()
         engine.load_model()
         counters = wrap_cache_manager(engine.cache_manager, mode)
-        expert_trace = wrap_expert_forward_trace(engine)
+        expert_trace = wrap_expert_forward_trace(engine) if TRACE_ROUTER else []
 
         inputs = tokenizer(PROMPT, return_tensors="pt")
         inputs = {key: value.to(DEVICE) for key, value in inputs.items()}
@@ -172,6 +173,7 @@ def run(mode: str, tokenizer: AutoTokenizer, gpu_cache: dict[int, int], cpu_cach
 
         generate_sec = time.perf_counter() - start
         new_tokens = output_ids.shape[-1] - inputs["input_ids"].shape[-1]
+        stats_fn = getattr(engine.cache_manager, "stats", None)
         return {
             "mode": mode,
             "cache_manager": type(engine.cache_manager).__name__,
@@ -179,6 +181,7 @@ def run(mode: str, tokenizer: AutoTokenizer, gpu_cache: dict[int, int], cpu_cach
             "tokens": new_tokens,
             "text": tokenizer.decode(output_ids[0], skip_special_tokens=True),
             "counters": counters,
+            "stats": stats_fn() if stats_fn is not None else {},
             "experts": expert_trace,
         }
     finally:
@@ -244,8 +247,8 @@ def main() -> None:
     print("Qwen 串行 / 异步 expert 加载对比")
     print("=" * 60)
 
-    serial = run("serial", tokenizer, gpu_cache, cpu_cache)
     async_result = run("async", tokenizer, gpu_cache, cpu_cache)
+    serial = run("serial", tokenizer, gpu_cache, cpu_cache)
 
     serial_time = float(serial["time"])
     async_time = float(async_result["time"])
@@ -262,11 +265,15 @@ def main() -> None:
     print(async_result["text"])
     print(f"\nserial counters: {serial['counters']}")
     print(f"async counters: {async_result['counters']}")
-    print()
-    print_expert_compare(
-        serial_experts=serial["experts"],
-        async_experts=async_result["experts"],
-    )
+    print(f"async stats: {async_result['stats']}")
+    if TRACE_ROUTER:
+        print()
+        print_expert_compare(
+            serial_experts=serial["experts"],
+            async_experts=async_result["experts"],
+        )
+    else:
+        print("\nrouter trace: disabled")
 
 
 if __name__ == "__main__":

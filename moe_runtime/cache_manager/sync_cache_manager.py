@@ -194,6 +194,7 @@ class asyncExpertCacheManager:
 
         # 后台调度线程只做非阻塞推进；真正等待只发生在 block 的 wait_any_ready。
         self._shutdown = False
+        self._closed = False
         self._scheduler = threading.Thread(
             target=self._scheduler_loop,
             name="moe-cache-scheduler",
@@ -937,14 +938,50 @@ class asyncExpertCacheManager:
         return offset, layer_slot_map
 
     def close(self) -> None:
-        """关闭后台调度线程和磁盘读取线程池。"""
+        """关闭后台调度资源，并等待异步任务不再持有 cache buffer。
+
+        async CacheManager 里同时存在三类后台工作：
+        - 调度线程：负责提交磁盘读取和 H2D 拷贝。
+        - 磁盘线程池：可能正在把 expert 写入 pinned CPU buffer。
+        - H2D CUDA stream：可能正在从 CPU buffer 拷贝到 GPU buffer。
+
+        如果 close 只发出停止信号而不等待这些任务结束，下一次运行马上分配新的
+        pinned CPU buffer 时，上一轮 buffer 仍可能被后台任务持有，从而触发 OOM。
+        """
+
+        if getattr(self, "_closed", False):
+            return
 
         with self._cv:
+            if self._closed:
+                return
+            self._closed = True
             self._shutdown = True
             self._cv.notify_all()
 
-        self._scheduler.join(timeout=1.0)
-        self._disk_pool.shutdown(wait=False, cancel_futures=True)
+        # 调度线程退出后，CacheManager 不会再提交新的磁盘读取或 H2D 拷贝。
+        self._scheduler.join()
+
+        # 已经提交到独立 stream 的 H2D 拷贝必须完成后，才能释放 CPU/GPU buffer。
+        if self._is_cuda_target and self._h2d_stream is not None:
+            self._h2d_stream.synchronize()
+
+        # 等待已经开始的磁盘读取完成；尚未开始的任务会被取消。
+        # 这一步确保没有线程继续写入 pinned CPU buffer。
+        self._disk_pool.shutdown(wait=True, cancel_futures=True)
+
+        # 断开大块 buffer 和状态表引用，帮助 Python/torch 尽快归还 pinned/GPU 内存。
+        self._cpu_buffer = None
+        self._gpu_buffer = None
+        self._cpu_slots.clear()
+        self._gpu_slots.clear()
+        self._requests.clear()
+        self._waiting_cpu.clear()
+        self._waiting_gpu.clear()
+        self._loading_cpu.clear()
+        self._loading_gpu.clear()
+        self._ready.clear()
+        self._compute_pending.clear()
 
     def __del__(self) -> None:
         """对象析构时尽量释放后台线程资源。"""
