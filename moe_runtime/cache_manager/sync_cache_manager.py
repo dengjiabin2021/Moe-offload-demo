@@ -17,7 +17,7 @@ from moe_runtime.loader import ManifestTensorLoader
 ExpertKey = tuple[int, int]
 
 # 磁盘读取线程数。当前一个请求会读取一个完整 expert，2 个 worker 可以让磁盘回源和 H2D/计算重叠。
-_MAX_DISK_WORKERS = 2
+_MAX_DISK_WORKERS = 3
 
 # 后台调度线程没有可推进任务时的短等待时间，单位秒。
 _SCHEDULER_WAIT_SECONDS = 0.0005

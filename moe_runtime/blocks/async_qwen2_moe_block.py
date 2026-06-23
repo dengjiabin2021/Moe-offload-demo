@@ -76,7 +76,7 @@ class asyncQwen2OnDemandExperts(nn.Module):
         # active_experts 记录当前层本次 forward 需要计算的 expert。
         active_experts: list[int] = []
         for expert_idx in expert_hit:
-            expert_id = expert_idx[0]
+            expert_id = int(expert_idx[0].item())
             if expert_id == self.num_experts:
                 continue
             active_experts.append(expert_id)

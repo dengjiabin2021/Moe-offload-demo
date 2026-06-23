@@ -1,26 +1,15 @@
-"""探测代理 / 包装器模块。
+"""异步 MoE Profiler 的统计数据结构。
 
-提供零侵入的代理类，包装 TensorLoader 和 CacheManager，
-在不修改原始代码的前提下拦截关键操作并记录指标。
-
-设计原则：
-- 只依赖接口契约（load_tensors_by_names / get_expert 等），不依赖具体模型。
-- 所有耗时用 time.perf_counter() + torch.cuda.synchronize() 保证 GPU 操作计时准确。
-- 通过 phase_ref（可变列表引用）感知当前阶段，无需直接依赖 Profiler。
+本模块只保存统计器和常量，不接触运行时逻辑。真正的 monkeypatch 注入在
+``moe_profiler.profiler`` 中完成。
 """
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
+import threading
 from typing import Any
 
-import torch
-
-
-# ==========================================================================
-# Phase 字符串常量（避免循环导入，tracker 和 profiler 共享）
-# ==========================================================================
 
 PHASE_IDLE = "idle"
 PHASE_LOADING = "loading"
@@ -28,388 +17,626 @@ PHASE_PREFILL = "prefill"
 PHASE_DECODE = "decode"
 
 
-# ==========================================================================
-# IO 追踪器
-# ==========================================================================
+@dataclass
+class TimeStats:
+    """一类操作的调用次数和 wall-clock 耗时统计。"""
+
+    count: int = 0
+    total_s: float = 0.0
+    max_s: float = 0.0
+
+    def record(self, elapsed_s: float) -> None:
+        """记录一次耗时。"""
+
+        self.count += 1
+        self.total_s += elapsed_s
+        self.max_s = max(self.max_s, elapsed_s)
+
+    @property
+    def avg_s(self) -> float:
+        """返回平均耗时。"""
+
+        if self.count == 0:
+            return 0.0
+        return self.total_s / self.count
+
+    def to_dict(self) -> dict[str, Any]:
+        """转换为可 JSON 序列化的字典。"""
+
+        return {
+            "count": self.count,
+            "total_s": self.total_s,
+            "avg_s": self.avg_s,
+            "max_s": self.max_s,
+        }
+
 
 @dataclass
-class IOTracker:
-    """IO 操作追踪器：记录各阶段的磁盘 IO 和 CPU↔GPU 传输。
+class TransferStats(TimeStats):
+    """带字节数的 IO / 搬运统计。"""
 
-    所有字节数以 Bytes 为单位，时间以秒为单位。
-    通过 phase_ref 感知当前处于哪个阶段。
-    """
+    bytes: int = 0
 
-    # —— 加载阶段 ——
-    loading_disk_bytes: int = 0
-    loading_disk_time_s: float = 0.0
-    loading_cpu_gpu_bytes: int = 0
-    loading_cpu_gpu_time_s: float = 0.0
+    def record_transfer(self, bytes_count: int, elapsed_s: float) -> None:
+        """记录一次数据传输。"""
 
-    # —— 预填充阶段 ——
-    prefill_disk_bytes: int = 0
-    prefill_disk_time_s: float = 0.0
-    prefill_cpu_gpu_bytes: int = 0
-    prefill_cpu_gpu_time_s: float = 0.0
+        self.bytes += int(bytes_count)
+        self.record(elapsed_s)
 
-    # —— 解码阶段 ——
-    decode_disk_bytes: int = 0
-    decode_disk_time_s: float = 0.0
-    decode_cpu_gpu_bytes: int = 0
-    decode_cpu_gpu_time_s: float = 0.0
+    @property
+    def mb(self) -> float:
+        """返回总传输量，单位 MB。"""
 
-    # —— 每次 forward 内部的数据搬运累计耗时（由 Profiler 在 pre_forward_hook 中重置）——
-    per_forward_data_time_s: float = 0.0
+        return self.bytes / 1024**2
 
-    # 指向 Profiler 当前阶段的引用（由 Profiler.wrap() 注入）
-    _phase_ref: list[str] = field(default_factory=lambda: [PHASE_IDLE])
+    @property
+    def throughput_mbps(self) -> float:
+        """返回平均吞吐，单位 MB/s。"""
 
-    # ---- 公开记录接口 ----
+        if self.total_s <= 0:
+            return 0.0
+        return self.mb / self.total_s
 
-    def record_disk_io(self, bytes_read: int, time_s: float) -> None:
-        """记录一次磁盘 IO 操作。"""
-        phase = self._phase_ref[0]
-        if phase == PHASE_LOADING:
-            self.loading_disk_bytes += bytes_read
-            self.loading_disk_time_s += time_s
-        elif phase == PHASE_PREFILL:
-            self.prefill_disk_bytes += bytes_read
-            self.prefill_disk_time_s += time_s
-        elif phase == PHASE_DECODE:
-            self.decode_disk_bytes += bytes_read
-            self.decode_disk_time_s += time_s
+    def to_dict(self) -> dict[str, Any]:
+        """转换为可 JSON 序列化的字典。"""
 
-    def record_cpu_gpu_transfer(self, bytes_transferred: int, time_s: float) -> None:
-        """记录一次 CPU→GPU 数据传输（含耗时）。"""
-        phase = self._phase_ref[0]
-        if phase == PHASE_LOADING:
-            self.loading_cpu_gpu_bytes += bytes_transferred
-            self.loading_cpu_gpu_time_s += time_s
-        elif phase == PHASE_PREFILL:
-            self.prefill_cpu_gpu_bytes += bytes_transferred
-            self.prefill_cpu_gpu_time_s += time_s
-        elif phase == PHASE_DECODE:
-            self.decode_cpu_gpu_bytes += bytes_transferred
-            self.decode_cpu_gpu_time_s += time_s
+        data = super().to_dict()
+        data.update(
+            {
+                "bytes": self.bytes,
+                "mb": self.mb,
+                "throughput_mbps": self.throughput_mbps,
+            }
+        )
+        return data
 
-        # 同时累计到 per-forward 计数器
-        self.per_forward_data_time_s += time_s
-
-    def reset_per_forward(self) -> None:
-        """重置 per-forward 数据搬运耗时（在每次 forward 开始前调用）。"""
-        self.per_forward_data_time_s = 0.0
-
-
-# ==========================================================================
-# 缓存追踪器
-# ==========================================================================
 
 @dataclass
 class CachePhaseStats:
-    """单个阶段的缓存统计。"""
+    """一个阶段内的 async expert 位置统计。"""
+
     gpu_hits: int = 0
     cpu_hits: int = 0
-    disk_fetches: int = 0
+    disk_misses: int = 0
 
     @property
-    def total_requests(self) -> int:
-        return self.gpu_hits + self.cpu_hits + self.disk_fetches
+    def total(self) -> int:
+        """返回本阶段 expert 请求总数。"""
+
+        return self.gpu_hits + self.cpu_hits + self.disk_misses
 
     @property
     def gpu_hit_rate(self) -> float:
-        if self.total_requests == 0:
-            return 0.0
-        return self.gpu_hits / self.total_requests
+        """返回 GPU 命中率。"""
+
+        return self.gpu_hits / self.total if self.total else 0.0
 
     @property
     def cpu_hit_rate(self) -> float:
-        if self.total_requests == 0:
-            return 0.0
-        return self.cpu_hits / self.total_requests
+        """返回 CPU 命中率。"""
+
+        return self.cpu_hits / self.total if self.total else 0.0
 
     @property
-    def miss_rate(self) -> float:
-        if self.total_requests == 0:
-            return 0.0
-        return self.disk_fetches / self.total_requests
+    def disk_miss_rate(self) -> float:
+        """返回磁盘 miss 率。"""
+
+        return self.disk_misses / self.total if self.total else 0.0
+
+    def record(self, kind: str) -> None:
+        """记录一次 expert 位置分类。"""
+
+        if kind == "gpu":
+            self.gpu_hits += 1
+        elif kind == "cpu":
+            self.cpu_hits += 1
+        elif kind == "disk":
+            self.disk_misses += 1
+        else:
+            raise ValueError(f"Unsupported cache kind: {kind}")
+
+    def to_dict(self) -> dict[str, Any]:
+        """转换为可 JSON 序列化的字典。"""
+
+        return {
+            "gpu_hits": self.gpu_hits,
+            "cpu_hits": self.cpu_hits,
+            "disk_misses": self.disk_misses,
+            "total": self.total,
+            "gpu_hit_rate": self.gpu_hit_rate,
+            "cpu_hit_rate": self.cpu_hit_rate,
+            "disk_miss_rate": self.disk_miss_rate,
+        }
 
 
 @dataclass
-class CacheTracker:
-    """缓存命中 / 未命中追踪器，按阶段拆分，同时记录逐层统计。
+class WaitRecord:
+    """一次 block 等待任意 expert ready 的阻塞记录。"""
 
-    通过 phase_ref 感知当前阶段。
-    """
+    layer_idx: int
+    pending_count: int
+    elapsed_s: float
+    ready_expert_idx: int
+    phase: str
+    dominant_reason: str
+    enter_counts: dict[str, int] = field(default_factory=dict)
+    exit_counts: dict[str, int] = field(default_factory=dict)
 
+    def to_dict(self) -> dict[str, Any]:
+        """转换为可 JSON 序列化的字典。"""
+
+        return {
+            "layer_idx": self.layer_idx,
+            "pending_count": self.pending_count,
+            "elapsed_s": self.elapsed_s,
+            "ready_expert_idx": self.ready_expert_idx,
+            "phase": self.phase,
+            "dominant_reason": self.dominant_reason,
+            "enter_counts": dict(self.enter_counts),
+            "exit_counts": dict(self.exit_counts),
+        }
+
+
+@dataclass
+class ResourceSample:
+    """后台调度器某一时刻的队列和 inflight 状态采样。"""
+
+    timestamp_s: float
+    phase: str
+    waiting_cpu_len: int
+    loading_cpu_count: int
+    waiting_gpu_len: int
+    loading_gpu_count: int
+    ready_count: int
+    compute_pending_count: int
+
+    def to_dict(self) -> dict[str, Any]:
+        """转换为可 JSON 序列化的字典。"""
+
+        return {
+            "timestamp_s": self.timestamp_s,
+            "phase": self.phase,
+            "waiting_cpu_len": self.waiting_cpu_len,
+            "loading_cpu_count": self.loading_cpu_count,
+            "waiting_gpu_len": self.waiting_gpu_len,
+            "loading_gpu_count": self.loading_gpu_count,
+            "ready_count": self.ready_count,
+            "compute_pending_count": self.compute_pending_count,
+        }
+
+
+@dataclass
+class AsyncCacheTracker:
+    """按 prefill/decode/layer 统计 expert 命中位置。"""
+
+    phase_ref: list[str]
     prefill: CachePhaseStats = field(default_factory=CachePhaseStats)
     decode: CachePhaseStats = field(default_factory=CachePhaseStats)
-    _phase_ref: list[str] = field(default_factory=lambda: [PHASE_IDLE])
+    other: CachePhaseStats = field(default_factory=CachePhaseStats)
+    layer_stats: dict[int, CachePhaseStats] = field(default_factory=dict)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
-    # 逐层统计（layer_idx → CachePhaseStats，跨阶段汇总）
-    _layer_stats: dict[int, CachePhaseStats] = field(default_factory=dict)
+    def record(self, kind: str, layer_idx: int | None) -> None:
+        """记录一次 expert 位置分类。"""
 
-    # ---- 公开记录接口 ----
-
-    def record_gpu_hit(self, _time_s: float = 0.0, *, layer_idx: int | None = None) -> None:
-        """记录一次 GPU 缓存命中。"""
-        self._get_phase_stats().gpu_hits += 1
-        if layer_idx is not None:
-            self._get_layer_stats(layer_idx).gpu_hits += 1
-
-    def record_cpu_hit(self, _time_s: float = 0.0, *, layer_idx: int | None = None) -> None:
-        """记录一次 CPU 缓存命中。"""
-        self._get_phase_stats().cpu_hits += 1
-        if layer_idx is not None:
-            self._get_layer_stats(layer_idx).cpu_hits += 1
-
-    def record_disk_fetch(self, _time_s: float = 0.0, *, layer_idx: int | None = None) -> None:
-        """记录一次磁盘回源（未命中）。"""
-        self._get_phase_stats().disk_fetches += 1
-        if layer_idx is not None:
-            self._get_layer_stats(layer_idx).disk_fetches += 1
-
-    # ---- 汇总 ----
+        with self._lock:
+            self._phase_stats().record(kind)
+            if layer_idx is not None:
+                self.layer_stats.setdefault(int(layer_idx), CachePhaseStats()).record(kind)
 
     @property
-    def gpu_hits(self) -> int:
-        return self.prefill.gpu_hits + self.decode.gpu_hits
+    def total(self) -> CachePhaseStats:
+        """聚合所有阶段的命中统计。"""
 
-    @property
-    def cpu_hits(self) -> int:
-        return self.prefill.cpu_hits + self.decode.cpu_hits
+        result = CachePhaseStats()
+        for stats in (self.prefill, self.decode, self.other):
+            result.gpu_hits += stats.gpu_hits
+            result.cpu_hits += stats.cpu_hits
+            result.disk_misses += stats.disk_misses
+        return result
 
-    @property
-    def disk_fetches(self) -> int:
-        return self.prefill.disk_fetches + self.decode.disk_fetches
+    def to_dict(self) -> dict[str, Any]:
+        """转换为可 JSON 序列化的字典。"""
 
-    @property
-    def total_requests(self) -> int:
-        return self.gpu_hits + self.cpu_hits + self.disk_fetches
+        with self._lock:
+            return {
+                "total": self.total.to_dict(),
+                "prefill": self.prefill.to_dict(),
+                "decode": self.decode.to_dict(),
+                "other": self.other.to_dict(),
+                "by_layer": {
+                    str(layer_idx): stats.to_dict()
+                    for layer_idx, stats in sorted(self.layer_stats.items())
+                },
+            }
 
-    @property
-    def gpu_hit_rate(self) -> float:
-        if self.total_requests == 0:
-            return 0.0
-        return self.gpu_hits / self.total_requests
+    def _phase_stats(self) -> CachePhaseStats:
+        """返回当前阶段对应的统计桶。"""
 
-    @property
-    def cpu_hit_rate(self) -> float:
-        if self.total_requests == 0:
-            return 0.0
-        return self.cpu_hits / self.total_requests
-
-    # ---- 逐层统计 ----
-
-    @property
-    def layer_stats(self) -> dict[int, CachePhaseStats]:
-        """返回按层聚合的缓存统计（按 layer_idx 排序）。"""
-        return dict(sorted(self._layer_stats.items()))
-
-    # ---- 内部 ----
-
-    def _get_phase_stats(self) -> CachePhaseStats:
-        phase = self._phase_ref[0]
+        phase = self.phase_ref[0]
         if phase == PHASE_PREFILL:
             return self.prefill
-        elif phase == PHASE_DECODE:
+        if phase == PHASE_DECODE:
             return self.decode
-        # loading 阶段通常不会有缓存请求，但兜底返回 prefill
-        return self.prefill
-
-    def _get_layer_stats(self, layer_idx: int) -> CachePhaseStats:
-        """获取或创建某层的缓存统计。"""
-        if layer_idx not in self._layer_stats:
-            self._layer_stats[layer_idx] = CachePhaseStats()
-        return self._layer_stats[layer_idx]
+        return self.other
 
 
-# ==========================================================================
-# ProfiledTensorLoader —— 包装 ManifestTensorLoader
-# ==========================================================================
+@dataclass
+class AsyncStageTracker:
+    """异步 CacheManager 内部状态机的等待/执行耗时统计。
 
-class ProfiledTensorLoader:
-    """ManifestTensorLoader 的探测代理。
-
-    拦截 load_tensors_by_names / load_tensors_to_buffer 两个核心 IO 方法，
-    记录每次磁盘读取的字节数和耗时。
+    统计项含义：
+    - waiting_cpu：disk miss 后，在 CPU slot 可用前排队的时间。
+    - loading_cpu：磁盘线程读取 expert 到 CPU buffer 的时间。
+    - waiting_gpu：CPU 已有 expert，等待 GPU slot 可写的时间。
+    - loading_gpu：H2D copy 提交后，到 event 完成的时间。
+    - compute_pending：block release 后，到计算 event 完成的保护时间。
+    - wait_any_ready：block 因没有 ready expert 而阻塞等待的时间。
     """
 
-    def __init__(self, real_loader: Any, io_tracker: IOTracker) -> None:
-        self._real = real_loader
-        self._io_tracker = io_tracker
+    public_methods: dict[str, TimeStats] = field(default_factory=dict)
+    scheduler_methods: dict[str, TimeStats] = field(default_factory=dict)
+    stage_waits: dict[str, TimeStats] = field(default_factory=dict)
+    wait_reasons: dict[str, TimeStats] = field(default_factory=dict)
+    wait_reasons_by_phase: dict[str, dict[str, TimeStats]] = field(default_factory=dict)
+    wait_by_layer: dict[int, TimeStats] = field(default_factory=dict)
+    wait_reason_by_layer: dict[int, dict[str, TimeStats]] = field(default_factory=dict)
+    wait_records: list[WaitRecord] = field(default_factory=list)
+    resource_samples: list[ResourceSample] = field(default_factory=list)
+    disk_io: TransferStats = field(default_factory=TransferStats)
+    resident_io: TransferStats = field(default_factory=TransferStats)
+    io_by_phase: dict[str, dict[str, TransferStats]] = field(default_factory=dict)
+    disk_worker_capacity: int = 2
+    _starts: dict[str, dict[tuple[int, int], float]] = field(default_factory=dict, repr=False)
+    _start_phases: dict[str, dict[tuple[int, int], str]] = field(default_factory=dict, repr=False)
+    _resource_base_s: float | None = field(default=None, repr=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
-        # 缓存 manifest 中每个 tensor 的 nbytes，用于推断 IO 量
-        self._tensor_nbytes_cache: dict[str, int] = {}
+    def record_public_method(self, name: str, elapsed_s: float) -> None:
+        """记录一次 CacheManager 公开接口耗时。"""
 
-    # ---- 代理需要暴露给外部的方法 ----
+        with self._lock:
+            self.public_methods.setdefault(name, TimeStats()).record(elapsed_s)
 
-    def load_tensors_by_names(self, *, tensor_names: list[str], device: str) -> dict[str, torch.Tensor]:
-        """代理：记录 IO 后委托给真实 loader。"""
-        # 估算即将读取的总字节数
-        total_bytes = sum(self._get_tensor_nbytes(name) for name in tensor_names)
+    def record_scheduler_method(self, name: str, elapsed_s: float, progressed: bool) -> None:
+        """记录一次后台调度函数耗时。"""
 
-        t0 = time.perf_counter()
-        if device.startswith("cuda"):
-            torch.cuda.synchronize()
-        result = self._real.load_tensors_by_names(tensor_names=tensor_names, device=device)
-        if device.startswith("cuda"):
-            torch.cuda.synchronize()
-        elapsed = time.perf_counter() - t0
+        key = f"{name}.progressed" if progressed else f"{name}.idle"
+        with self._lock:
+            self.scheduler_methods.setdefault(key, TimeStats()).record(elapsed_s)
+            self.scheduler_methods.setdefault(name, TimeStats()).record(elapsed_s)
 
-        self._io_tracker.record_disk_io(bytes_read=total_bytes, time_s=elapsed)
-        return result
-
-    def load_tensors_to_buffer(
-        self, *, tensor_names: list[str], buffer: torch.Tensor, slot_idx: int
-    ) -> None:
-        """代理：记录 IO 后委托给真实 loader。"""
-        total_bytes = sum(self._get_tensor_nbytes(name) for name in tensor_names)
-
-        t0 = time.perf_counter()
-        if buffer.device.type == "cuda":
-            torch.cuda.synchronize()
-        self._real.load_tensors_to_buffer(tensor_names=tensor_names, buffer=buffer, slot_idx=slot_idx)
-        if buffer.device.type == "cuda":
-            torch.cuda.synchronize()
-        elapsed = time.perf_counter() - t0
-
-        self._io_tracker.record_disk_io(bytes_read=total_bytes, time_s=elapsed)
-
-    def load_tensor_by_name(self, *, tensor_name: str, device: str) -> torch.Tensor:
-        """代理：记录单 tensor IO。"""
-        total_bytes = self._get_tensor_nbytes(tensor_name)
-
-        t0 = time.perf_counter()
-        if device.startswith("cuda"):
-            torch.cuda.synchronize()
-        result = self._real.load_tensor_by_name(tensor_name=tensor_name, device=device)
-        if device.startswith("cuda"):
-            torch.cuda.synchronize()
-        elapsed = time.perf_counter() - t0
-
-        self._io_tracker.record_disk_io(bytes_read=total_bytes, time_s=elapsed)
-        return result
-
-    def get_tensor_info(self, *, tensor_name: str) -> tuple:
-        """透传：不涉及 IO，直接委托。"""
-        return self._real.get_tensor_info(tensor_name=tensor_name)
-
-    def has_tensor(self, *, tensor_name: str) -> bool:
-        """透传：不涉及 IO，直接委托。"""
-        return self._real.has_tensor(tensor_name=tensor_name)
-
-    # ---- 内部辅助 ----
-
-    def _get_tensor_nbytes(self, tensor_name: str) -> int:
-        """获取某个 tensor 的字节数（从 manifest 缓存）。"""
-        if tensor_name not in self._tensor_nbytes_cache:
-            # 从真实 loader 的 manifest 中读取 nbytes
-            entry = self._real._read_manifest_entry(tensor_name=tensor_name)
-            self._tensor_nbytes_cache[tensor_name] = entry["nbytes"]
-        return self._tensor_nbytes_cache[tensor_name]
-
-    # ---- 属性透传 ----
-
-    def __getattr__(self, name: str) -> Any:
-        """将未拦截的属性访问全部透传给真实 loader。"""
-        return getattr(self._real, name)
-
-
-# ==========================================================================
-# ProfiledCacheManager —— 包装 ExpertCacheManager
-# ==========================================================================
-
-class ProfiledCacheManager:
-    """ExpertCacheManager 的探测代理。
-
-    拦截 get_expert() 调用，通过预查确定是 GPU 命中 / CPU 命中 / 磁盘回源，
-    并记录耗时、缓存统计和 CPU→GPU 数据传输量。
-    """
-
-    def __init__(
+    def start_stage(
         self,
-        real_cache: Any,
-        cache_tracker: CacheTracker,
-        io_tracker: IOTracker,
+        stage: str,
+        key: tuple[int, int],
+        timestamp_s: float,
+        phase: str | None = None,
     ) -> None:
-        self._real = real_cache
-        self._cache_tracker = cache_tracker
-        self._io_tracker = io_tracker
+        """标记某个 expert 进入异步阶段。"""
 
-        # 预计算单个专家的字节数（用于统计 CPU→GPU 传输量）
-        self._expert_bytes: int = self._compute_expert_bytes()
+        with self._lock:
+            self._starts.setdefault(stage, {})[key] = timestamp_s
+            if phase is not None:
+                self._start_phases.setdefault(stage, {})[key] = phase
 
-    # ---- 核心拦截：get_expert ----
+    def finish_stage(self, stage: str, key: tuple[int, int], timestamp_s: float) -> tuple[float, str | None] | None:
+        """标记某个 expert 离开异步阶段，并累计等待时间。"""
 
-    def get_expert(self, layer_idx: int, expert_idx: int) -> dict[str, torch.Tensor]:
-        """获取专家权重，同时记录缓存命中 / 未命中统计。
+        with self._lock:
+            started_at = self._starts.setdefault(stage, {}).pop(key, None)
+            if started_at is None:
+                return None
+            phase = self._start_phases.setdefault(stage, {}).pop(key, None)
+            elapsed_s = max(0.0, timestamp_s - started_at)
+            self.stage_waits.setdefault(stage, TimeStats()).record(elapsed_s)
+            return elapsed_s, phase
 
-        策略：先调用 _find_expert_in_slots 预查专家位置，
-        再委托给真实 get_expert，根据预查结果记录相应指标。
+    def record_disk_io(self, bytes_count: int, elapsed_s: float, phase: str | None = None) -> None:
+        """记录 routed expert 的磁盘到 CPU buffer 读取。"""
+
+        with self._lock:
+            self.disk_io.record_transfer(bytes_count, elapsed_s)
+            if phase is not None:
+                self._phase_io(phase, "disk_to_cpu").record_transfer(bytes_count, elapsed_s)
+
+    def record_resident_io(
+        self,
+        bytes_count: int,
+        elapsed_s: float,
+        phase: str | None = None,
+        *,
+        includes_h2d: bool = False,
+    ) -> None:
+        """记录模型常驻权重加载。"""
+
+        with self._lock:
+            self.resident_io.record_transfer(bytes_count, elapsed_s)
+            if phase is not None:
+                self._phase_io(phase, "disk_to_cpu").record_transfer(bytes_count, elapsed_s)
+                if includes_h2d:
+                    self._phase_io(phase, "cpu_to_gpu").record_transfer(bytes_count, elapsed_s)
+
+    def record_cpu_gpu_io(self, bytes_count: int, elapsed_s: float, phase: str | None) -> None:
+        """记录 CPU 到 GPU 的 H2D 搬运。"""
+
+        if phase is None:
+            return
+        with self._lock:
+            self._phase_io(phase, "cpu_to_gpu").record_transfer(bytes_count, elapsed_s)
+
+    def record_wait_any_ready(
+        self,
+        *,
+        layer_idx: int,
+        pending_count: int,
+        elapsed_s: float,
+        ready_expert_idx: int,
+        phase: str,
+        dominant_reason: str,
+        enter_counts: dict[str, int],
+        exit_counts: dict[str, int],
+    ) -> None:
+        """记录 block 在 wait_any_ready 中真实阻塞的一次等待。
+
+        这里统计的是 Python/block 控制流真正停住的 wall-clock 时间，不是某个
+        expert 生命周期阶段的累加时间。因此它更适合判断生成延迟到底卡在 CPU
+        队列、磁盘读取、H2D 还是 GPU 计算保护上。
         """
-        has_cuda = torch.cuda.is_available()
 
-        # —— 预查：判断专家当前在 GPU / CPU / 磁盘 ——
-        gpu_slot = self._real._find_expert_in_slots(
-            self._real._gpu_slots,
-            self._real._gpu_layer_slot_map,
-            layer_idx,
-            expert_idx,
-        )
-        cpu_slot = None
-        if gpu_slot is None:
-            cpu_slot = self._real._find_expert_in_slots(
-                self._real._cpu_slots,
-                self._real._cpu_layer_slot_map,
-                layer_idx,
-                expert_idx,
+        reason = dominant_reason or "unknown"
+        with self._lock:
+            self.wait_reasons.setdefault(reason, TimeStats()).record(elapsed_s)
+            self.wait_reasons_by_phase.setdefault(phase, {}).setdefault(reason, TimeStats()).record(elapsed_s)
+            self.wait_by_layer.setdefault(layer_idx, TimeStats()).record(elapsed_s)
+            self.wait_reason_by_layer.setdefault(layer_idx, {}).setdefault(reason, TimeStats()).record(elapsed_s)
+            self.wait_records.append(
+                WaitRecord(
+                    layer_idx=layer_idx,
+                    pending_count=pending_count,
+                    elapsed_s=elapsed_s,
+                    ready_expert_idx=ready_expert_idx,
+                    phase=phase,
+                    dominant_reason=reason,
+                    enter_counts=dict(enter_counts),
+                    exit_counts=dict(exit_counts),
+                )
             )
 
-        # —— 计时执行 ——
-        if has_cuda:
-            torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        result = self._real.get_expert(layer_idx, expert_idx)
-        if has_cuda:
-            torch.cuda.synchronize()
-        elapsed = time.perf_counter() - t0
+    def record_resource_sample(
+        self,
+        *,
+        timestamp_s: float,
+        phase: str,
+        waiting_cpu_len: int,
+        loading_cpu_count: int,
+        waiting_gpu_len: int,
+        loading_gpu_count: int,
+        ready_count: int,
+        compute_pending_count: int,
+    ) -> None:
+        """记录后台调度器队列长度和 inflight 数量。
 
-        # —— 根据预查结果记录指标 ——
-        if gpu_slot is not None:
-            self._cache_tracker.record_gpu_hit(elapsed, layer_idx=layer_idx)
-        elif cpu_slot is not None:
-            self._cache_tracker.record_cpu_hit(elapsed, layer_idx=layer_idx)
-            # CPU 命中意味着一次 CPU→GPU 数据传输
-            self._io_tracker.record_cpu_gpu_transfer(
-                bytes_transferred=self._expert_bytes,
-                time_s=elapsed,
-            )
-        else:
-            self._cache_tracker.record_disk_fetch(elapsed, layer_idx=layer_idx)
-            # 磁盘回源：一次磁盘 IO + 一次 CPU→GPU 传输
-            # 注意：磁盘 IO 的精确字节数和耗时由 ProfiledTensorLoader 独立记录，
-            # 这里只记录 CPU→GPU 部分。
-            self._io_tracker.record_cpu_gpu_transfer(
-                bytes_transferred=self._expert_bytes,
-                time_s=elapsed,  # 包含磁盘 IO + copy 的总时间，近似
+        采样点用于后续做时间加权平均，从而估算磁盘 worker、H2D copy 和计算
+        保护队列是否被持续压满。
+        """
+
+        with self._lock:
+            if self._resource_base_s is None:
+                self._resource_base_s = timestamp_s
+            relative_s = max(0.0, timestamp_s - self._resource_base_s)
+            self.resource_samples.append(
+                ResourceSample(
+                    timestamp_s=relative_s,
+                    phase=phase,
+                    waiting_cpu_len=waiting_cpu_len,
+                    loading_cpu_count=loading_cpu_count,
+                    waiting_gpu_len=waiting_gpu_len,
+                    loading_gpu_count=loading_gpu_count,
+                    ready_count=ready_count,
+                    compute_pending_count=compute_pending_count,
+                )
             )
 
+    def to_dict(self) -> dict[str, Any]:
+        """转换为可 JSON 序列化的字典。"""
+
+        with self._lock:
+            return {
+                "public_methods": {
+                    name: stats.to_dict()
+                    for name, stats in sorted(self.public_methods.items())
+                },
+                "scheduler_methods": {
+                    name: stats.to_dict()
+                    for name, stats in sorted(self.scheduler_methods.items())
+                },
+                "stage_waits": {
+                    name: stats.to_dict()
+                    for name, stats in sorted(self.stage_waits.items())
+                },
+                "wait_reasons": {
+                    name: stats.to_dict()
+                    for name, stats in sorted(self.wait_reasons.items())
+                },
+                "wait_reasons_by_phase": {
+                    phase: {
+                        name: stats.to_dict()
+                        for name, stats in sorted(reason_stats.items())
+                    }
+                    for phase, reason_stats in sorted(self.wait_reasons_by_phase.items())
+                },
+                "wait_by_layer": self._wait_by_layer_dict_locked(),
+                "wait_records": [record.to_dict() for record in self.wait_records],
+                "resource_utilization": self._resource_utilization_dict_locked(),
+                "resource_samples": [sample.to_dict() for sample in self.resource_samples],
+                "disk_io": self.disk_io.to_dict(),
+                "resident_io": self.resident_io.to_dict(),
+                "io_by_phase": {
+                    phase: {
+                        direction: stats.to_dict()
+                        for direction, stats in sorted(direction_stats.items())
+                    }
+                    for phase, direction_stats in sorted(self.io_by_phase.items())
+                },
+            }
+
+    def _phase_io(self, phase: str, direction: str) -> TransferStats:
+        """获取某个阶段和方向的 IO 统计桶。"""
+
+        phase_stats = self.io_by_phase.setdefault(phase, {})
+        return phase_stats.setdefault(direction, TransferStats())
+
+    def _wait_by_layer_dict_locked(self) -> dict[str, Any]:
+        """汇总每层 wait_any_ready 的真实阻塞时间。"""
+
+        result: dict[str, Any] = {}
+        for layer_idx, stats in sorted(self.wait_by_layer.items()):
+            reason_stats = self.wait_reason_by_layer.get(layer_idx, {})
+            main_reason = ""
+            main_reason_total_s = 0.0
+            if reason_stats:
+                main_reason, main_stats = max(
+                    reason_stats.items(),
+                    key=lambda item: item[1].total_s,
+                )
+                main_reason_total_s = main_stats.total_s
+
+            data = stats.to_dict()
+            data.update(
+                {
+                    "main_reason": main_reason,
+                    "main_reason_total_s": main_reason_total_s,
+                    "reasons": {
+                        name: reason.to_dict()
+                        for name, reason in sorted(reason_stats.items())
+                    },
+                }
+            )
+            result[str(layer_idx)] = data
         return result
 
-    # ---- 属性透传 ----
+    def _resource_utilization_dict_locked(self) -> dict[str, Any]:
+        """根据调度器采样点估算后台资源利用率。
 
-    def __getattr__(self, name: str) -> Any:
-        """将未拦截的属性访问全部透传给真实 cache_manager。
-
-        包括 step()、_gpu_buffer、_cpu_buffer 等所有内部访问。
+        该统计是时间加权估算：相邻两个采样点之间，认为前一个采样点的状态持续
+        到后一个采样点。它不会影响运行时调度，只用于回答资源是否被压满。
         """
-        return getattr(self._real, name)
 
-    # ---- 内部辅助 ----
+        samples = self.resource_samples
+        empty_result = {
+            "observed_s": 0.0,
+            "disk_worker_capacity": self.disk_worker_capacity,
+            "disk_workers": self._resource_metric_dict(0.0, 0.0, 0.0, 0),
+            "h2d": self._resource_metric_dict(0.0, 0.0, 0.0, 0),
+            "compute_pending": self._resource_metric_dict(0.0, 0.0, 0.0, 0),
+            "waiting_cpu_queue": self._queue_metric_dict(0.0, 0),
+            "waiting_gpu_queue": self._queue_metric_dict(0.0, 0),
+            "ready_queue": self._queue_metric_dict(0.0, 0),
+        }
+        if not samples:
+            return empty_result
 
-    def _compute_expert_bytes(self) -> int:
-        """根据真实 cache_manager 的内部信息计算单个专家的字节数。"""
-        expert_elems = getattr(self._real, "_expert_elems", 0)
-        expert_dtype = getattr(self._real, "_expert_dtype", torch.float16)
-        element_size = torch.empty((), dtype=expert_dtype).element_size()
-        return expert_elems * element_size
+        observed_s = max(0.0, samples[-1].timestamp_s - samples[0].timestamp_s)
+        max_loading_cpu = max(sample.loading_cpu_count for sample in samples)
+        max_loading_gpu = max(sample.loading_gpu_count for sample in samples)
+        max_compute = max(sample.compute_pending_count for sample in samples)
+        max_waiting_cpu = max(sample.waiting_cpu_len for sample in samples)
+        max_waiting_gpu = max(sample.waiting_gpu_len for sample in samples)
+        max_ready = max(sample.ready_count for sample in samples)
+
+        if observed_s <= 0 or len(samples) == 1:
+            return {
+                "observed_s": observed_s,
+                "disk_worker_capacity": self.disk_worker_capacity,
+                "disk_workers": self._resource_metric_dict(0.0, 0.0, 0.0, max_loading_cpu),
+                "h2d": self._resource_metric_dict(0.0, 0.0, 0.0, max_loading_gpu),
+                "compute_pending": self._resource_metric_dict(0.0, 0.0, 0.0, max_compute),
+                "waiting_cpu_queue": self._queue_metric_dict(0.0, max_waiting_cpu),
+                "waiting_gpu_queue": self._queue_metric_dict(0.0, max_waiting_gpu),
+                "ready_queue": self._queue_metric_dict(0.0, max_ready),
+            }
+
+        disk_area = 0.0
+        disk_active_s = 0.0
+        h2d_area = 0.0
+        h2d_active_s = 0.0
+        compute_area = 0.0
+        compute_active_s = 0.0
+        waiting_cpu_area = 0.0
+        waiting_gpu_area = 0.0
+        ready_area = 0.0
+
+        for index, sample in enumerate(samples[:-1]):
+            next_sample = samples[index + 1]
+            dt = max(0.0, next_sample.timestamp_s - sample.timestamp_s)
+            if dt <= 0:
+                continue
+
+            disk_inflight = min(sample.loading_cpu_count, self.disk_worker_capacity)
+            disk_area += disk_inflight * dt
+            if disk_inflight > 0:
+                disk_active_s += dt
+
+            h2d_area += sample.loading_gpu_count * dt
+            if sample.loading_gpu_count > 0:
+                h2d_active_s += dt
+
+            compute_area += sample.compute_pending_count * dt
+            if sample.compute_pending_count > 0:
+                compute_active_s += dt
+
+            waiting_cpu_area += sample.waiting_cpu_len * dt
+            waiting_gpu_area += sample.waiting_gpu_len * dt
+            ready_area += sample.ready_count * dt
+
+        return {
+            "observed_s": observed_s,
+            "disk_worker_capacity": self.disk_worker_capacity,
+            "disk_workers": self._resource_metric_dict(
+                busy_ratio=disk_area / (observed_s * max(1, self.disk_worker_capacity)),
+                active_ratio=disk_active_s / observed_s,
+                avg_inflight=disk_area / observed_s,
+                max_inflight=max_loading_cpu,
+            ),
+            "h2d": self._resource_metric_dict(
+                busy_ratio=h2d_active_s / observed_s,
+                active_ratio=h2d_active_s / observed_s,
+                avg_inflight=h2d_area / observed_s,
+                max_inflight=max_loading_gpu,
+            ),
+            "compute_pending": self._resource_metric_dict(
+                busy_ratio=compute_active_s / observed_s,
+                active_ratio=compute_active_s / observed_s,
+                avg_inflight=compute_area / observed_s,
+                max_inflight=max_compute,
+            ),
+            "waiting_cpu_queue": self._queue_metric_dict(waiting_cpu_area / observed_s, max_waiting_cpu),
+            "waiting_gpu_queue": self._queue_metric_dict(waiting_gpu_area / observed_s, max_waiting_gpu),
+            "ready_queue": self._queue_metric_dict(ready_area / observed_s, max_ready),
+        }
+
+    @staticmethod
+    def _resource_metric_dict(
+        busy_ratio: float,
+        active_ratio: float,
+        avg_inflight: float,
+        max_inflight: int,
+    ) -> dict[str, Any]:
+        """构造资源利用率指标字典。"""
+
+        return {
+            "busy_ratio": busy_ratio,
+            "active_ratio": active_ratio,
+            "avg_inflight": avg_inflight,
+            "max_inflight": max_inflight,
+        }
+
+    @staticmethod
+    def _queue_metric_dict(avg_len: float, max_len: int) -> dict[str, Any]:
+        """构造队列长度指标字典。"""
+
+        return {
+            "avg_len": avg_len,
+            "max_len": max_len,
+        }
