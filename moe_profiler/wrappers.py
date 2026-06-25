@@ -292,6 +292,18 @@ class AsyncStageTracker:
     _resource_base_s: float | None = field(default=None, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
+    def set_disk_worker_capacity(self, capacity: int) -> None:
+        """设置磁盘读取 worker 容量。
+
+        这个值来自 async CacheManager 实际创建的线程池，只用于计算 profiler
+        里的 busy ratio；不参与运行时调度。
+        """
+
+        if capacity <= 0:
+            return
+        with self._lock:
+            self.disk_worker_capacity = int(capacity)
+
     def record_public_method(self, name: str, elapsed_s: float) -> None:
         """记录一次 CacheManager 公开接口耗时。"""
 
@@ -469,6 +481,7 @@ class AsyncStageTracker:
                 "wait_by_layer": self._wait_by_layer_dict_locked(),
                 "wait_records": [record.to_dict() for record in self.wait_records],
                 "resource_utilization": self._resource_utilization_dict_locked(),
+                "resource_utilization_by_phase": self._resource_utilization_by_phase_dict_locked(),
                 "resource_samples": [sample.to_dict() for sample in self.resource_samples],
                 "disk_io": self.disk_io.to_dict(),
                 "resident_io": self.resident_io.to_dict(),
@@ -523,7 +536,26 @@ class AsyncStageTracker:
         到后一个采样点。它不会影响运行时调度，只用于回答资源是否被压满。
         """
 
-        samples = self.resource_samples
+        return self._resource_utilization_for_samples_locked(self.resource_samples)
+
+    def _resource_utilization_by_phase_dict_locked(self) -> dict[str, Any]:
+        """按 phase 分别估算后台资源利用率。
+
+        总览指标会把 loading、prefill、decode、idle 全部混到同一个时间窗口里。
+        分阶段指标能看出 worker 是在 prefill 满载，还是 decode 供给不足。
+        """
+
+        phases = sorted({sample.phase for sample in self.resource_samples})
+        return {
+            phase: self._resource_utilization_for_samples_locked(
+                [sample for sample in self.resource_samples if sample.phase == phase]
+            )
+            for phase in phases
+        }
+
+    def _resource_utilization_for_samples_locked(self, samples: list[ResourceSample]) -> dict[str, Any]:
+        """对指定采样序列计算时间加权资源利用率。"""
+
         empty_result = {
             "observed_s": 0.0,
             "disk_worker_capacity": self.disk_worker_capacity,

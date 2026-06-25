@@ -33,6 +33,7 @@ class AsyncProfileReport:
 
     model_dir: str
     cache_manager_name: str
+    cache_policy: str
     build_time_s: float
     load_time_s: float
     generate_time_s: float
@@ -63,6 +64,7 @@ class AsyncProfileReport:
         print(sep)
         print(f"  模型目录: {self.model_dir}")
         print(f"  CacheManager: {self.cache_manager_name}")
+        print(f"  cache_policy: {self.cache_policy}")
         print()
 
         self._print_timing_section(sub)
@@ -70,7 +72,6 @@ class AsyncProfileReport:
         self._print_async_wait_section(sub)
         self._print_block_wait_reason_section(sub)
         self._print_resource_utilization_section(sub)
-        self._print_layer_wait_topk_section(sub)
         self._print_io_section(sub)
         self._print_memory_section(sub)
 
@@ -82,6 +83,7 @@ class AsyncProfileReport:
         return {
             "model_dir": self.model_dir,
             "cache_manager_name": self.cache_manager_name,
+            "cache_policy": self.cache_policy,
             "timing": {
                 "build_time_s": self.build_time_s,
                 "load_time_s": self.load_time_s,
@@ -222,12 +224,12 @@ class AsyncProfileReport:
         print()
 
     def _print_block_wait_reason_section(self, sub: str) -> None:
-        """打印 block 真实阻塞时间的原因归因。"""
+        """打印等待 expert 加载完成时，实际卡住的原因。"""
 
-        print("  [4] Block 等待归因")
+        print("  [4] Expert 加载等待原因")
         print(sub)
         if self.stage_tracker is None:
-            print("  无 block 等待归因")
+            print("  无 expert 等待统计")
             print()
             return
 
@@ -279,7 +281,8 @@ class AsyncProfileReport:
             print()
             return
 
-        utilization = self.stage_tracker.to_dict().get("resource_utilization", {})
+        data = self.stage_tracker.to_dict()
+        utilization = data.get("resource_utilization", {})
         observed_s = utilization.get("observed_s", 0.0)
         if observed_s <= 0:
             print("  无足够采样点")
@@ -300,6 +303,17 @@ class AsyncProfileReport:
         self._print_queue_row("waiting_gpu", utilization.get("waiting_gpu_queue", {}))
         self._print_queue_row("ready", utilization.get("ready_queue", {}))
         print()
+
+        by_phase = data.get("resource_utilization_by_phase", {})
+        if by_phase:
+            print("  按阶段资源利用率")
+            print("  phase       observed_s   disk_busy   disk_avg   h2d_active    h2d_avg   wait_cpu_avg  wait_cpu_max")
+            print("  " + "-" * 98)
+            for phase in (PHASE_LOADING, PHASE_PREFILL, PHASE_DECODE, "idle"):
+                phase_utilization = by_phase.get(phase)
+                if phase_utilization is not None:
+                    self._print_phase_resource_row(phase, phase_utilization)
+            print()
 
     @staticmethod
     def _print_resource_row(label: str, stats: dict[str, Any], *, use_busy: bool) -> None:
@@ -323,40 +337,28 @@ class AsyncProfileReport:
             f"{stats.get('max_len', 0):>16}"
         )
 
-    def _print_layer_wait_topk_section(self, sub: str, top_k: int = 10) -> None:
-        """打印 block 等待最重的层。"""
+    @staticmethod
+    def _print_phase_resource_row(label: str, stats: dict[str, Any]) -> None:
+        """打印一行分阶段资源利用率。"""
 
-        print("  [6] 按层等待 Top-K")
-        print(sub)
-        if self.stage_tracker is None:
-            print("  无按层等待统计")
-            print()
-            return
-
-        by_layer = self.stage_tracker.to_dict().get("wait_by_layer", {})
-        if not by_layer:
-            print("  无 wait_any_ready 阻塞记录")
-            print()
-            return
-
-        rows = sorted(by_layer.items(), key=lambda item: item[1].get("total_s", 0.0), reverse=True)[:top_k]
-        print("  layer      count      total_s      avg_ms      max_ms    main_reason")
-        print("  " + "-" * 78)
-        for layer_idx, stats in rows:
-            print(
-                f"  {layer_idx:<8}"
-                f"{stats.get('count', 0):>8}"
-                f"{stats.get('total_s', 0.0):>13.3f}"
-                f"{stats.get('avg_s', 0.0) * 1000:>12.3f}"
-                f"{stats.get('max_s', 0.0) * 1000:>12.3f}"
-                f"    {stats.get('main_reason', '')}"
-            )
-        print()
+        disk_stats = stats.get("disk_workers", {})
+        h2d_stats = stats.get("h2d", {})
+        waiting_cpu = stats.get("waiting_cpu_queue", {})
+        print(
+            f"  {label:<10}"
+            f"{stats.get('observed_s', 0.0):>11.3f}"
+            f"{disk_stats.get('busy_ratio', 0.0):>12.2%}"
+            f"{disk_stats.get('avg_inflight', 0.0):>11.3f}"
+            f"{h2d_stats.get('active_ratio', 0.0):>13.2%}"
+            f"{h2d_stats.get('avg_inflight', 0.0):>11.3f}"
+            f"{waiting_cpu.get('avg_len', 0.0):>15.3f}"
+            f"{waiting_cpu.get('max_len', 0):>14}"
+        )
 
     def _print_io_section(self, sub: str) -> None:
         """打印分阶段 IO 统计。"""
 
-        print("  [7] IO 分阶段统计")
+        print("  [6] IO 分阶段统计")
         print(sub)
         print("  phase       direction        size_mb      time_s   throughput_mb_s")
         print("  " + "-" * 70)
@@ -397,7 +399,7 @@ class AsyncProfileReport:
     def _print_memory_section(self, sub: str) -> None:
         """打印分阶段内存峰值。"""
 
-        print("  [8] 内存峰值")
+        print("  [7] 内存峰值")
         print(sub)
         for phase in (PHASE_LOADING, PHASE_PREFILL, PHASE_DECODE):
             samples = [sample for sample in self.memory_timeline if sample.phase == phase]

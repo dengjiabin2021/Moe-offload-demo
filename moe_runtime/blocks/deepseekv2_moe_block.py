@@ -73,7 +73,7 @@ class DeepseekV2OnDemandExperts(nn.Module):
             raise RuntimeError("Qwen2MoeExperts.cache_manager 未设置，无法按需获取专家权重。")
     
         for expert_idx in expert_hit:
-            expert_idx = expert_idx[0]
+            expert_idx = int(expert_idx[0].item())
             if expert_idx == self.num_experts:
                 continue
 

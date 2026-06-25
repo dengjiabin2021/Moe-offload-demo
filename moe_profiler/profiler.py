@@ -149,15 +149,18 @@ class Profiler:
         memory_timeline = self._memory_sampler.stop()
         engine = self._engine
         cache_name = ""
+        cache_policy = ""
         model_dir = ""
         if engine is not None:
             model_dir = str(engine.config.model_dir)
+            cache_policy = str(getattr(engine.config, "cache_policy", ""))
             if getattr(engine, "cache_manager", None) is not None:
                 cache_name = type(engine.cache_manager).__name__
 
         return AsyncProfileReport(
             model_dir=model_dir,
             cache_manager_name=cache_name,
+            cache_policy=cache_policy,
             build_time_s=self._build_time_s,
             load_time_s=self._load_time_s,
             generate_time_s=self._generate_time_s,
@@ -317,6 +320,7 @@ class Profiler:
             return
         cache_manager._async_profiler_patched = True
 
+        self._stage_tracker.set_disk_worker_capacity(self._disk_worker_capacity(cache_manager))
         self._wrap_public_cache_methods(cache_manager)
         self._wrap_enqueue(cache_manager)
         self._expert_bytes = self._compute_expert_bytes(cache_manager)
@@ -325,6 +329,16 @@ class Profiler:
         self._wrap_scheduler_method(cache_manager, "_schedule_h2d_locked")
         self._wrap_scheduler_method(cache_manager, "_complete_finished_h2d_locked")
         self._wrap_scheduler_method(cache_manager, "_complete_finished_compute_locked")
+
+    @staticmethod
+    def _disk_worker_capacity(cache_manager: Any) -> int:
+        """读取 async CacheManager 实际磁盘线程池容量。"""
+
+        disk_pool = getattr(cache_manager, "_disk_pool", None)
+        max_workers = getattr(disk_pool, "_max_workers", None)
+        if max_workers is None:
+            return 2
+        return int(max_workers)
 
     def _wrap_public_cache_methods(self, cache_manager: Any) -> None:
         """包装 CacheManager 公开接口。"""

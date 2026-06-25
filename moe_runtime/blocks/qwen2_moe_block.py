@@ -77,7 +77,7 @@ class Qwen2OnDemandExperts(nn.Module):
 
         # 逐个执行本次 forward 中实际命中的 expert，逻辑与官方 Qwen2MoeExperts 基本一致。
         for expert_idx in expert_hit:
-            expert_idx = expert_idx[0]
+            expert_idx = int(expert_idx[0].item())
             if expert_idx == self.num_experts:
                 continue
 

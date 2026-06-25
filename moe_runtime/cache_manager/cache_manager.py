@@ -23,8 +23,9 @@ class _SlotInfo:
     """
     layer_idx: int | None = None        # 所属 transformer 层编号
     expert_idx: int | None = None       # 当前存储的专家编号，None = 空闲
-    status: str = "free"                # "free" | "used" | "evicted"
+    status: str = "free"                # "free" | "used"
     last_used_step: int = 0             # 最后命中时的全局 step
+    access_count: int = 0               # 当前 expert 在该 slot 中的命中次数
 
 
 # ======================================================================
@@ -39,9 +40,8 @@ class ExpertCacheManager:
       buffer 形状为 [num_slots, expert_elems]，每"行"存一个展平的专家权重。
       同层 slot 在 buffer 中连续排列，保证 forward 时显存访问的连续性。
     - 每行对应一条 _SlotInfo 映射记录，跟踪 layer / expert / status / step。
-    - 驱逐为懒操作：仅将映射表状态改为 "evicted"，数据留在原地不搬运。
-      需要新 slot 时按 free > evicted > LRU-used 优先级覆盖。
-    - 全局 step 计数器追踪每行"多少步没被使用"，作为 LRU 淘汰依据。
+    - 需要新 slot 时按 free > used 优先级覆盖；used 的覆盖顺序由 cache_policy 控制。
+    - 全局 step 计数器追踪每行"多少步没被使用"，作为 LRU 或 LFU 同频兜底依据。
     - 通过 adapter 获取张量名，tensor_loader 从磁盘加载权重。
     """
 
@@ -92,7 +92,7 @@ class ExpertCacheManager:
                 self._expert_elems,
                 dtype=self._expert_dtype,
                 device=self._cpu_device,
-                pin_memory=self._is_cuda_target
+                #pin_memory=self._is_cuda_target
             )
 
         if self._num_gpu_experts > 0:
@@ -177,14 +177,14 @@ class ExpertCacheManager:
     ) -> int | None:
         """在指定层的 slot 范围内查找专家，返回 slot 索引或 None。
 
-        匹配条件：expert_idx 相同且 status != "free"（used 或 evicted 都算命中）。
+        匹配条件：expert_idx 相同且 status == "used"。
         """
         r = layer_slot_map.get(layer_idx)
         if r is None:
             return None
         for i in range(r[0], r[1]):
             s = slots[i]
-            if s.expert_idx == expert_idx and s.status != "free":
+            if s.expert_idx == expert_idx and s.status == "used":
                 return i
         return None
 
@@ -197,8 +197,7 @@ class ExpertCacheManager:
 
         layout 格式：{"gate": [1408,2048], "up": [1408,2048], "down": [2048,1408]}
         """
-        self._gpu_slots[gpu_slot_idx].status = "used"
-        self._gpu_slots[gpu_slot_idx].last_used_step = self._global_step
+        self._touch_slot(self._gpu_slots[gpu_slot_idx])
         offset = 0
         result: dict[str, torch.Tensor] = {}
         for role, shape in self._expert_layout.items():
@@ -221,11 +220,8 @@ class ExpertCacheManager:
         self._gpu_buffer[gpu_slot_idx, :].copy_(self._cpu_buffer[cpu_slot_idx, :])
 
         self._gpu_slots[gpu_slot_idx].expert_idx = expert_idx
-        self._gpu_slots[gpu_slot_idx].status = "used"
-        self._gpu_slots[gpu_slot_idx].last_used_step = self._global_step
-
-        # CPU 源行标记 evicted（数据残留，后续可覆盖）
-        self._cpu_slots[cpu_slot_idx].status = "evicted"
+        self._reset_slot_usage(self._gpu_slots[gpu_slot_idx])
+        self._touch_slot(self._cpu_slots[cpu_slot_idx])
 
         return self._get_expert_from_gpu(gpu_slot_idx)
     
@@ -247,20 +243,19 @@ class ExpertCacheManager:
         )
 
         self._cpu_slots[cpu_slot_idx].expert_idx = expert_idx
-        self._cpu_slots[cpu_slot_idx].status = "used"
-        self._cpu_slots[cpu_slot_idx].last_used_step = self._global_step
+        self._reset_slot_usage(self._cpu_slots[cpu_slot_idx])
+        self._touch_slot(self._cpu_slots[cpu_slot_idx])
 
         # CPU buffer 整行拷入 GPU buffer
         gpu_slot_idx = self._find_slot_to_overwrite_gpu(layer_idx)
         self._gpu_buffer[gpu_slot_idx, :].copy_(self._cpu_buffer[cpu_slot_idx, :])
         self._gpu_slots[gpu_slot_idx].expert_idx = expert_idx
-        self._gpu_slots[gpu_slot_idx].status = "used"
-        self._gpu_slots[gpu_slot_idx].last_used_step = self._global_step
+        self._reset_slot_usage(self._gpu_slots[gpu_slot_idx])
 
         return self._get_expert_from_gpu(gpu_slot_idx)
 
     # ==================================================================
-    # 可覆盖 slot 选择：优先 free → evicted → LRU-used
+    # 可覆盖 slot 选择：优先 free → used
     # ==================================================================
 
     def _find_slot_to_overwrite_gpu(self, layer_idx: int) -> int:
@@ -271,35 +266,51 @@ class ExpertCacheManager:
         """在指定层 CPU slot 范围内选可覆盖 slot。"""
         return self._pick_slot(self._cpu_slots, self._cpu_layer_slot_map, layer_idx)
 
-    @staticmethod
     def _pick_slot(
+        self,
         slots: list[_SlotInfo],
         layer_slot_map: dict[int, tuple[int, int]],
         layer_idx: int,
     ) -> int:
         """在指定层 slot 范围内选可覆盖 slot。
 
-        优先级：free > evicted > LRU-used（last_used_step 最小）。
+        优先级：free > used；used 的覆盖顺序由 cache_policy 决定。
         """
         r = layer_slot_map[layer_idx]
         free_idx: int | None = None
-        evicted_idx: int | None = None
         used_idx: int | None = None
-        used_step: int = 2 ** 63
 
         for i in range(r[0], r[1]):
             st = slots[i].status
             if st == "free":
                 free_idx = i
                 break
-            if st == "evicted":
-                evicted_idx = i
-                break
-            if st == "used" and slots[i].last_used_step < used_step:
-                used_step = slots[i].last_used_step
+            if st == "used" and self._is_better_victim(slots[i], slots[used_idx] if used_idx is not None else None):
                 used_idx = i
 
-        return free_idx if free_idx is not None else (evicted_idx if evicted_idx is not None else used_idx)
+        return free_idx if free_idx is not None else used_idx
+
+    def _is_better_victim(self, candidate: _SlotInfo, current: _SlotInfo | None) -> bool:
+        """按 cache_policy 判断 candidate 是否比 current 更适合被覆盖。"""
+
+        if current is None:
+            return True
+        if self.config.cache_policy == "lfu" and candidate.access_count != current.access_count:
+            return candidate.access_count < current.access_count
+        return candidate.last_used_step < current.last_used_step
+
+    def _reset_slot_usage(self, slot: _SlotInfo) -> None:
+        """新 expert 写入 slot 后，重置使用统计。"""
+
+        slot.status = "used"
+        slot.last_used_step = self._global_step
+        slot.access_count = 0
+
+    def _touch_slot(self, slot: _SlotInfo) -> None:
+        """expert 命中时更新使用统计。"""
+
+        slot.last_used_step = self._global_step
+        slot.access_count += 1
 
 
     def _load_tensors_to_buffer(

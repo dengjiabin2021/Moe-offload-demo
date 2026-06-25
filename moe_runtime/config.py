@@ -29,8 +29,8 @@ class RuntimeConfig:
     # 专家权重按需加载后的目标设备。
     routed_expert_device: str = "cuda"
 
-    # 缓存策略。
-    cache_policy: str = "none"
+    # 缓存淘汰策略：lru 表示覆盖最久未使用的专家；lfu 表示覆盖访问频率最低的专家。
+    cache_policy: str = "lru"
 
     # CacheManager 实现模式：serial 使用串行加载；async 使用异步加载。
     cache_manager_mode: str = "async"
@@ -46,6 +46,9 @@ class RuntimeConfig:
 
     def __post_init__(self) -> None:
         """规范化路径字段，保证 RuntimeEngine 内部拿到的是 Path。"""
+
+        if self.cache_policy not in {"lru", "lfu"}:
+            raise ValueError(f"Unsupported cache_policy: {self.cache_policy}. Expected 'lru' or 'lfu'.")
 
         # model_dir 是必填项，统一转换为绝对路径。
         self.model_dir = Path(self.model_dir).resolve()

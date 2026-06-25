@@ -59,8 +59,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cpu-cache-per-layer",
         type=int,
-        default=10,
+        default=24,
         help="每个 routed expert 层的 CPU expert cache 数量。",
+    )
+    parser.add_argument(
+        "--cache-policy",
+        choices=("lru", "lfu"),
+        default="lru",
+        help="缓存淘汰策略：lru 覆盖最久未使用的专家；lfu 覆盖访问频率最低的专家。",
     )
     parser.add_argument(
         "--output-dir",
@@ -133,6 +139,7 @@ def main() -> None:
         non_expert_device=args.device,
         shared_expert_device=args.device,
         routed_expert_device=args.device,
+        cache_policy=args.cache_policy,
         max_gpu_cache_capacity=gpu_cache,
         max_cpu_cache_capacity=cpu_cache,
     )
@@ -153,6 +160,7 @@ def main() -> None:
         print(f"  max_new_tokens: {args.max_new_tokens}")
         print(f"  GPU cache/layer: {args.gpu_cache_per_layer}")
         print(f"  CPU cache/layer: {args.cpu_cache_per_layer}")
+        print(f"  cache_policy: {args.cache_policy}")
 
         print("\n[1/4] 构建组件 ...")
         engine.build_components()

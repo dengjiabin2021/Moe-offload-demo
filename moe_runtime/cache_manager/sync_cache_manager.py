@@ -17,7 +17,7 @@ from moe_runtime.loader import ManifestTensorLoader
 ExpertKey = tuple[int, int]
 
 # 磁盘读取线程数。当前一个请求会读取一个完整 expert，2 个 worker 可以让磁盘回源和 H2D/计算重叠。
-_MAX_DISK_WORKERS = 3
+_MAX_DISK_WORKERS = 6
 
 # 后台调度线程没有可推进任务时的短等待时间，单位秒。
 _SCHEDULER_WAIT_SECONDS = 0.0005
@@ -45,6 +45,9 @@ class _SlotInfo:
 
     # LRU 依据。只有 used slot 可以被覆盖，last_used_step 越小越早被覆盖。
     last_used_step: int = 0
+
+    # LFU 依据。当前 expert 在该 slot 中被命中的次数越少，越容易被覆盖。
+    access_count: int = 0
 
     # slot 每次被重新写入都会递增 generation，用来识别异步事件完成时是否已经过期。
     generation: int = 0
@@ -158,7 +161,7 @@ class asyncExpertCacheManager:
             self._expert_elems,
             dtype=self._expert_dtype,
             device=self._cpu_device,
-            pin_memory=self._is_cuda_target
+            #pin_memory=self._is_cuda_target
         )
 
         # GPU buffer 是 block 计算时直接读取的专家权重池。
@@ -266,6 +269,7 @@ class asyncExpertCacheManager:
                 return False
 
             gpu_slot = self._gpu_slots[gpu_slot_idx]
+            self._touch_slot(gpu_slot)
             # ready expert 必须 protected，避免 block 计算前或计算中被 LRU 覆盖。
             gpu_slot.status = "protected"
             self._requests[key] = _ExpertRequest(
@@ -506,6 +510,7 @@ class asyncExpertCacheManager:
                 raise RuntimeError(f"Loading GPU expert CPU source slot state is invalid: {key}")
 
             # H2D 完成后直接 protected，因为这个 expert 是当前 block 正在等待计算的。
+            self._reset_slot_usage(gpu_slot)
             gpu_slot.status = "protected"
             req.stage = "ready"
             self._loading_gpu.discard(key)
@@ -561,6 +566,7 @@ class asyncExpertCacheManager:
                 raise RuntimeError(f"Loading CPU expert slot state is invalid: {key}")
 
             # 磁盘已经写完整个 expert，CPU slot 可读但暂时不可覆盖，等待 H2D。
+            self._reset_slot_usage(cpu_slot)
             cpu_slot.status = "protected"
             req.stage = "waiting_gpu"
             self._loading_cpu.discard(key)
@@ -707,6 +713,7 @@ class asyncExpertCacheManager:
 
         if gpu_slot_idx is not None:
             gpu_slot = self._gpu_slots[gpu_slot_idx]
+            self._touch_slot(gpu_slot)
             # ready expert 必须 protected，避免 block 计算前或计算中被 LRU 覆盖。
             gpu_slot.status = "protected"
             self._requests[key] = _ExpertRequest(
@@ -729,6 +736,7 @@ class asyncExpertCacheManager:
 
         if cpu_slot_idx is not None:
             cpu_slot = self._cpu_slots[cpu_slot_idx]
+            self._touch_slot(cpu_slot)
             cpu_slot.status = "protected"
             self._requests[key] = _ExpertRequest(
                 layer_idx=key[0],
@@ -798,8 +806,8 @@ class asyncExpertCacheManager:
 
         return result
 
-    @staticmethod
     def _pick_slot(
+        self,
         slots: list[_SlotInfo],
         layer_slot_map: dict[int, tuple[int, int]],
         layer_idx: int,
@@ -808,7 +816,7 @@ class asyncExpertCacheManager:
 
         优先级：
         1. free：空槽，写入成本最低。
-        2. used 中 last_used_step 最小的 slot：LRU 覆盖。
+        2. used：按 cache_policy 选择 victim。
 
         protected 和 loading 都不可覆盖。
         """
@@ -819,7 +827,6 @@ class asyncExpertCacheManager:
 
         free_idx: int | None = None
         used_idx: int | None = None
-        used_step = 2**63
 
         for slot_idx in range(slot_range[0], slot_range[1]):
             slot = slots[slot_idx]
@@ -827,11 +834,32 @@ class asyncExpertCacheManager:
                 free_idx = slot_idx
                 break
 
-            if slot.status == "used" and slot.last_used_step < used_step:
-                used_step = slot.last_used_step
+            if slot.status == "used" and self._is_better_victim(slot, slots[used_idx] if used_idx is not None else None):
                 used_idx = slot_idx
 
         return free_idx if free_idx is not None else used_idx
+
+    def _is_better_victim(self, candidate: _SlotInfo, current: _SlotInfo | None) -> bool:
+        """按 cache_policy 判断 candidate 是否比 current 更适合被覆盖。"""
+
+        if current is None:
+            return True
+        if self.config.cache_policy == "lfu" and candidate.access_count != current.access_count:
+            return candidate.access_count < current.access_count
+        return candidate.last_used_step < current.last_used_step
+
+    def _reset_slot_usage(self, slot: _SlotInfo) -> None:
+        """新 expert 写入 slot 后，初始化使用统计。"""
+
+        slot.status = "used"
+        slot.last_used_step = self._global_step
+        slot.access_count = 1
+
+    def _touch_slot(self, slot: _SlotInfo) -> None:
+        """expert 命中时更新使用统计。"""
+
+        slot.last_used_step = self._global_step
+        slot.access_count += 1
 
     def _raise_if_error(self, key: ExpertKey) -> None:
         """如果某个异步任务失败，将后台异常重新抛给 block。"""

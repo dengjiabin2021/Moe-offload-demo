@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import gc
 import sys
 import time
@@ -17,14 +18,27 @@ if str(PROJECT_ROOT) not in sys.path:
 from moe_runtime import MoeRuntimeEngine, RuntimeConfig
 
 
-MODEL_DIR = PROJECT_ROOT / "models" / "Qwen1.5-Moe-A2.7B"
+MODEL_DIR = PROJECT_ROOT / "models" / "DeepSeek-V2-Lite"
 DEVICE = "cuda"
 MAX_NEW_TOKENS = 32
-GPU_CACHE_PER_LAYER = 4
-CPU_CACHE_PER_LAYER = 8
+GPU_CACHE_PER_LAYER = 6
+CPU_CACHE_PER_LAYER = 24
 PROMPT = "问：你好 答：你好！有什么我可以帮你的吗? 问: 1+1=? 答："
 CLEANUP_WAIT_SECONDS = 5
 TRACE_ROUTER = False
+
+
+def parse_args() -> argparse.Namespace:
+    """解析 benchmark 运行参数。"""
+
+    parser = argparse.ArgumentParser(description="对比 Qwen 串行/异步 expert 加载耗时。")
+    parser.add_argument(
+        "--cache-policy",
+        choices=("lru", "lfu"),
+        default="lru",
+        help="缓存淘汰策略：lru 覆盖最久未使用的专家；lfu 覆盖访问频率最低的专家。",
+    )
+    return parser.parse_args()
 
 
 def sync_cuda() -> None:
@@ -136,7 +150,58 @@ def wrap_expert_forward_trace(engine: MoeRuntimeEngine) -> list[list[object]]:
     return trace
 
 
-def run(mode: str, tokenizer: AutoTokenizer, gpu_cache: dict[int, int], cpu_cache: dict[int, int]) -> dict[str, object]:
+def register_phase_timer(engine: MoeRuntimeEngine) -> tuple[dict[str, float | int], list[Any]]:
+    """注册 generate 阶段计时 hook，用于拆分 prefill 和 decode。"""
+
+    model = engine.model_runtime.model
+    timer: dict[str, float | int] = {
+        "forward_count": 0,
+        "prefill_start": 0.0,
+        "prefill_end": 0.0,
+        "decode_start": 0.0,
+    }
+
+    def pre_hook(module: Any, args: tuple[Any, ...]) -> None:
+        forward_count = int(timer["forward_count"])
+
+        if forward_count == 0:
+            # 第一次模型 forward 是 prefill；先同步，避免把前置 CUDA 工作算进去。
+            sync_cuda()
+            timer["prefill_start"] = time.perf_counter()
+            return
+
+        if forward_count == 1 and float(timer["prefill_end"]) == 0.0:
+            # 第二次模型 forward 开始前，第一次 forward 的 CUDA 工作应全部结清。
+            # 这里作为 prefill/decode 的边界，后续时间归入 decode。
+            sync_cuda()
+            now = time.perf_counter()
+            timer["prefill_end"] = now
+            timer["decode_start"] = now
+
+    def post_hook(module: Any, args: tuple[Any, ...], output: Any) -> None:
+        timer["forward_count"] = int(timer["forward_count"]) + 1
+
+    handles = [
+        model.register_forward_pre_hook(pre_hook),
+        model.register_forward_hook(post_hook),
+    ]
+    return timer, handles
+
+
+def remove_hooks(handles: list[Any]) -> None:
+    """移除测试脚本注册的 hook，避免影响后续模式运行。"""
+
+    for handle in handles:
+        handle.remove()
+
+
+def run(
+    mode: str,
+    tokenizer: AutoTokenizer,
+    gpu_cache: dict[int, int],
+    cpu_cache: dict[int, int],
+    cache_policy: str,
+) -> dict[str, object]:
     """运行一次 serial 或 async 模式，并返回生成耗时。"""
 
     config = RuntimeConfig(
@@ -145,6 +210,7 @@ def run(mode: str, tokenizer: AutoTokenizer, gpu_cache: dict[int, int], cpu_cach
         non_expert_device=DEVICE,
         shared_expert_device=DEVICE,
         routed_expert_device=DEVICE,
+        cache_policy=cache_policy,
         max_gpu_cache_capacity=gpu_cache,
         max_cpu_cache_capacity=cpu_cache,
     )
@@ -159,25 +225,42 @@ def run(mode: str, tokenizer: AutoTokenizer, gpu_cache: dict[int, int], cpu_cach
 
         inputs = tokenizer(PROMPT, return_tensors="pt")
         inputs = {key: value.to(DEVICE) for key, value in inputs.items()}
+        phase_timer, hook_handles = register_phase_timer(engine)
 
         sync_cuda()
         start = time.perf_counter()
-        with torch.inference_mode():
-            output_ids = engine.generate(
-                **inputs,
-                max_new_tokens=MAX_NEW_TOKENS,
-                do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-        sync_cuda()
+        try:
+            with torch.inference_mode():
+                output_ids = engine.generate(
+                    **inputs,
+                    max_new_tokens=MAX_NEW_TOKENS,
+                    do_sample=False,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+            sync_cuda()
+        finally:
+            remove_hooks(hook_handles)
 
-        generate_sec = time.perf_counter() - start
+        end = time.perf_counter()
+        generate_sec = end - start
+        prefill_start = float(phase_timer["prefill_start"])
+        prefill_end = float(phase_timer["prefill_end"])
+        decode_start = float(phase_timer["decode_start"])
+        if prefill_end == 0.0:
+            # 如果只发生了一次 forward，则整段 generate 都属于 prefill。
+            prefill_end = end
+            decode_start = end
+
         new_tokens = output_ids.shape[-1] - inputs["input_ids"].shape[-1]
         stats_fn = getattr(engine.cache_manager, "stats", None)
         return {
             "mode": mode,
             "cache_manager": type(engine.cache_manager).__name__,
             "time": generate_sec,
+            "prefill_time": max(0.0, prefill_end - prefill_start),
+            "decode_time": max(0.0, end - decode_start),
+            "prefill_tokens": int(inputs["input_ids"].shape[-1]),
+            "decode_tokens": int(new_tokens),
             "tokens": new_tokens,
             "text": tokenizer.decode(output_ids[0], skip_special_tokens=True),
             "counters": counters,
@@ -240,22 +323,51 @@ def print_first_token_diff(serial_item: list[object], async_item: list[object]) 
 def main() -> None:
     """对比 Qwen 模型串行和异步 expert 加载耗时。"""
 
+    args = parse_args()
     tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
     gpu_cache, cpu_cache = build_cache_config()
 
     print("=" * 60)
     print("Qwen 串行 / 异步 expert 加载对比")
     print("=" * 60)
+    print(f"cache_policy: {args.cache_policy}")
 
-    async_result = run("async", tokenizer, gpu_cache, cpu_cache)
-    serial = run("serial", tokenizer, gpu_cache, cpu_cache)
+    async_result = run("async", tokenizer, gpu_cache, cpu_cache, args.cache_policy)
+    serial = run("serial", tokenizer, gpu_cache, cpu_cache, args.cache_policy)
 
     serial_time = float(serial["time"])
     async_time = float(async_result["time"])
     speedup = serial_time / async_time if async_time > 0 else 0.0
+    serial_prefill = float(serial["prefill_time"])
+    async_prefill = float(async_result["prefill_time"])
+    serial_decode = float(serial["decode_time"])
+    async_decode = float(async_result["decode_time"])
+    prefill_speedup = serial_prefill / async_prefill if async_prefill > 0 else 0.0
+    decode_speedup = serial_decode / async_decode if async_decode > 0 else 0.0
 
     print(f"serial: {serial_time:.2f}s, cache={serial['cache_manager']}")
     print(f"async:  {async_time:.2f}s, cache={async_result['cache_manager']}")
+    print()
+    print("stage time:")
+    print("mode      total(s)   prefill(s)   decode(s)   decode tokens/s")
+    print("-" * 61)
+    print(
+        f"serial   {serial_time:>8.2f}   "
+        f"{serial_prefill:>10.2f}   "
+        f"{serial_decode:>9.2f}   "
+        f"{float(serial['decode_tokens']) / serial_decode if serial_decode > 0 else 0.0:>15.3f}"
+    )
+    print(
+        f"async    {async_time:>8.2f}   "
+        f"{async_prefill:>10.2f}   "
+        f"{async_decode:>9.2f}   "
+        f"{float(async_result['decode_tokens']) / async_decode if async_decode > 0 else 0.0:>15.3f}"
+    )
+    print(
+        f"speedup  {speedup:>8.2f}x  "
+        f"{prefill_speedup:>10.2f}x  "
+        f"{decode_speedup:>9.2f}x"
+    )
     print(f"tokens: {serial['tokens']}")
     print(f"speedup: {speedup:.2f}x")
     print(f"output same: {serial['text'] == async_result['text']}")
