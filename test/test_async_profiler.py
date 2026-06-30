@@ -59,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cpu-cache-per-layer",
         type=int,
-        default=24,
+        default=10,
         help="每个 routed expert 层的 CPU expert cache 数量。",
     )
     parser.add_argument(

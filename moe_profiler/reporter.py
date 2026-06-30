@@ -54,6 +54,22 @@ class AsyncProfileReport:
             return 0.0
         return self.decode_token_count / self.generate_time_s
 
+    @property
+    def prefill_tokens_per_second(self) -> float:
+        """返回 prefill 阶段的平均 token/s。"""
+
+        if self.prefill_time_s <= 0:
+            return 0.0
+        return self.prefill_token_count / self.prefill_time_s
+
+    @property
+    def decode_tokens_per_second(self) -> float:
+        """返回 decode 阶段的平均 token/s。"""
+
+        if self.decode_time_s <= 0:
+            return 0.0
+        return self.decode_token_count / self.decode_time_s
+
     def print_summary(self) -> None:
         """打印终端摘要。"""
 
@@ -70,7 +86,6 @@ class AsyncProfileReport:
         self._print_timing_section(sub)
         self._print_cache_section(sub)
         self._print_async_wait_section(sub)
-        self._print_block_wait_reason_section(sub)
         self._print_resource_utilization_section(sub)
         self._print_io_section(sub)
         self._print_memory_section(sub)
@@ -91,6 +106,8 @@ class AsyncProfileReport:
                 "prefill_time_s": self.prefill_time_s,
                 "decode_time_s": self.decode_time_s,
                 "tokens_per_second": self.tokens_per_second,
+                "prefill_tokens_per_second": self.prefill_tokens_per_second,
+                "decode_tokens_per_second": self.decode_tokens_per_second,
                 "prefill_token_count": self.prefill_token_count,
                 "decode_token_count": self.decode_token_count,
             },
@@ -145,6 +162,8 @@ class AsyncProfileReport:
         print(f"  prefill:          {self.prefill_time_s:>10.3f}s  tokens={self.prefill_token_count}")
         print(f"  decode:           {self.decode_time_s:>10.3f}s  tokens={self.decode_token_count}")
         print(f"  tokens/s:         {self.tokens_per_second:>10.3f}")
+        print(f"  prefill tokens/s: {self.prefill_tokens_per_second:>10.3f}")
+        print(f"  decode tokens/s:  {self.decode_tokens_per_second:>10.3f}")
         print()
 
     def _print_cache_section(self, sub: str) -> None:
@@ -167,11 +186,14 @@ class AsyncProfileReport:
             self._print_cache_row("other", self.cache_tracker.other)
 
         print()
-        print("  按层缓存命中 (layer cache)")
-        print("  layer       gpu      cpu     disk    total    gpu_rate   cpu_rate   disk_rate")
-        print("  " + "-" * 78)
-        for layer_idx, stats in sorted(self.cache_tracker.layer_stats.items()):
-            self._print_cache_row(str(layer_idx), stats)
+        print("  按层分阶段缓存命中")
+        print("  layer   phase       gpu      cpu     disk    total    gpu_rate   cpu_rate   disk_rate")
+        print("  " + "-" * 88)
+        for phase in (PHASE_PREFILL, PHASE_DECODE):
+            for layer_idx, phase_stats in sorted(self.cache_tracker.layer_phase_stats.items()):
+                stats = phase_stats.get(phase)
+                if stats is not None and stats.total:
+                    self._print_cache_layer_phase_row(layer_idx, phase, stats)
         print()
 
     @staticmethod
@@ -180,6 +202,22 @@ class AsyncProfileReport:
 
         print(
             f"  {label:<8}"
+            f"{stats.gpu_hits:>7}"
+            f"{stats.cpu_hits:>9}"
+            f"{stats.disk_misses:>9}"
+            f"{stats.total:>9}"
+            f"{stats.gpu_hit_rate:>10.2%}"
+            f"{stats.cpu_hit_rate:>11.2%}"
+            f"{stats.disk_miss_rate:>11.2%}"
+        )
+
+    @staticmethod
+    def _print_cache_layer_phase_row(layer_idx: int, phase: str, stats: CachePhaseStats) -> None:
+        """打印某一层在某个阶段内的缓存命中统计。"""
+
+        print(
+            f"  {layer_idx:<7}"
+            f"{phase:<8}"
             f"{stats.gpu_hits:>7}"
             f"{stats.cpu_hits:>9}"
             f"{stats.disk_misses:>9}"
@@ -220,13 +258,41 @@ class AsyncProfileReport:
             f"max={wait_ready.get('max_s', 0.0) * 1000:>10.3f}ms"
         )
         print()
+        print("  phase/stage wait")
+        print("  phase       stage             count      total_s      avg_ms      max_ms")
+        print("  " + "-" * 78)
+        data = self.stage_tracker.to_dict()
+        stage_by_phase = data.get("stage_waits_by_phase", {})
+        public_by_phase = data.get("public_methods_by_phase", {})
+        for phase in (PHASE_PREFILL, PHASE_DECODE):
+            phase_waits = stage_by_phase.get(phase, {})
+            for name in ("waiting_cpu", "loading_cpu", "waiting_gpu", "loading_gpu", "compute_pending"):
+                stats = phase_waits.get(name, {})
+                self._print_phase_wait_row(phase, name, stats)
+            wait_ready = public_by_phase.get(phase, {}).get("wait_any_ready", {})
+            self._print_phase_wait_row(phase, "wait_any_ready", wait_ready)
+        print()
         print("  说明: 前五项是按 expert 生命周期累加，可能大于 generate；wait_any_ready 才是 block 实际阻塞时间。")
         print()
+
+    @staticmethod
+    def _print_phase_wait_row(phase: str, name: str, stats: dict[str, Any]) -> None:
+        """打印某个阶段内某类异步等待耗时。"""
+
+        print(
+            f"  {phase:<10}"
+            f"{name:<16}"
+            f"{stats.get('count', 0):>8}"
+            f"{stats.get('total_s', 0.0):>13.3f}"
+            f"{stats.get('avg_s', 0.0) * 1000:>12.3f}"
+            f"{stats.get('max_s', 0.0) * 1000:>12.3f}"
+        )
 
     def _print_block_wait_reason_section(self, sub: str) -> None:
         """打印等待 expert 加载完成时，实际卡住的原因。"""
 
         print("  [4] Expert 加载等待原因")
+        print("  [4] Expert load wait reasons")
         print(sub)
         if self.stage_tracker is None:
             print("  无 expert 等待统计")
@@ -274,7 +340,7 @@ class AsyncProfileReport:
     def _print_resource_utilization_section(self, sub: str) -> None:
         """打印后台调度资源利用率。"""
 
-        print("  [5] 后台资源利用率")
+        print("  [4] 后台资源利用率")
         print(sub)
         if self.stage_tracker is None:
             print("  无后台资源采样")
@@ -282,7 +348,21 @@ class AsyncProfileReport:
             return
 
         data = self.stage_tracker.to_dict()
-        utilization = data.get("resource_utilization", {})
+        by_phase = data.get("resource_utilization_by_phase", {})
+        if not by_phase:
+            print("  no resource samples")
+            print()
+            return
+
+        print("  phase resource utilization")
+        print("  phase       observed_s   disk_busy   disk_avg   h2d_active    h2d_avg   wait_cpu_avg  wait_cpu_max")
+        print("  " + "-" * 98)
+        for phase in (PHASE_LOADING, PHASE_PREFILL, PHASE_DECODE, "idle"):
+            phase_utilization = by_phase.get(phase)
+            if phase_utilization is not None:
+                self._print_phase_resource_row(phase, phase_utilization)
+        print()
+        return
         observed_s = utilization.get("observed_s", 0.0)
         if observed_s <= 0:
             print("  无足够采样点")
@@ -358,7 +438,7 @@ class AsyncProfileReport:
     def _print_io_section(self, sub: str) -> None:
         """打印分阶段 IO 统计。"""
 
-        print("  [6] IO 分阶段统计")
+        print("  [5] IO 分阶段统计")
         print(sub)
         print("  phase       direction        size_mb      time_s   throughput_mb_s")
         print("  " + "-" * 70)
@@ -399,7 +479,7 @@ class AsyncProfileReport:
     def _print_memory_section(self, sub: str) -> None:
         """打印分阶段内存峰值。"""
 
-        print("  [7] 内存峰值")
+        print("  [6] 内存峰值")
         print(sub)
         for phase in (PHASE_LOADING, PHASE_PREFILL, PHASE_DECODE):
             samples = [sample for sample in self.memory_timeline if sample.phase == phase]

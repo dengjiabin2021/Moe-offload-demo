@@ -214,15 +214,22 @@ class AsyncCacheTracker:
     decode: CachePhaseStats = field(default_factory=CachePhaseStats)
     other: CachePhaseStats = field(default_factory=CachePhaseStats)
     layer_stats: dict[int, CachePhaseStats] = field(default_factory=dict)
+    layer_phase_stats: dict[int, dict[str, CachePhaseStats]] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def record(self, kind: str, layer_idx: int | None) -> None:
         """记录一次 expert 位置分类。"""
 
         with self._lock:
+            phase = self.phase_ref[0]
             self._phase_stats().record(kind)
             if layer_idx is not None:
-                self.layer_stats.setdefault(int(layer_idx), CachePhaseStats()).record(kind)
+                norm_layer_idx = int(layer_idx)
+                self.layer_stats.setdefault(norm_layer_idx, CachePhaseStats()).record(kind)
+                self.layer_phase_stats.setdefault(norm_layer_idx, {}).setdefault(
+                    phase,
+                    CachePhaseStats(),
+                ).record(kind)
 
     @property
     def total(self) -> CachePhaseStats:
@@ -247,6 +254,13 @@ class AsyncCacheTracker:
                 "by_layer": {
                     str(layer_idx): stats.to_dict()
                     for layer_idx, stats in sorted(self.layer_stats.items())
+                },
+                "by_layer_phase": {
+                    str(layer_idx): {
+                        phase: phase_stats.to_dict()
+                        for phase, phase_stats in sorted(layer_stats.items())
+                    }
+                    for layer_idx, layer_stats in sorted(self.layer_phase_stats.items())
                 },
             }
 
@@ -275,8 +289,10 @@ class AsyncStageTracker:
     """
 
     public_methods: dict[str, TimeStats] = field(default_factory=dict)
+    public_methods_by_phase: dict[str, dict[str, TimeStats]] = field(default_factory=dict)
     scheduler_methods: dict[str, TimeStats] = field(default_factory=dict)
     stage_waits: dict[str, TimeStats] = field(default_factory=dict)
+    stage_waits_by_phase: dict[str, dict[str, TimeStats]] = field(default_factory=dict)
     wait_reasons: dict[str, TimeStats] = field(default_factory=dict)
     wait_reasons_by_phase: dict[str, dict[str, TimeStats]] = field(default_factory=dict)
     wait_by_layer: dict[int, TimeStats] = field(default_factory=dict)
@@ -304,11 +320,13 @@ class AsyncStageTracker:
         with self._lock:
             self.disk_worker_capacity = int(capacity)
 
-    def record_public_method(self, name: str, elapsed_s: float) -> None:
+    def record_public_method(self, name: str, elapsed_s: float, phase: str | None = None) -> None:
         """记录一次 CacheManager 公开接口耗时。"""
 
         with self._lock:
             self.public_methods.setdefault(name, TimeStats()).record(elapsed_s)
+            if phase is not None:
+                self.public_methods_by_phase.setdefault(phase, {}).setdefault(name, TimeStats()).record(elapsed_s)
 
     def record_scheduler_method(self, name: str, elapsed_s: float, progressed: bool) -> None:
         """记录一次后台调度函数耗时。"""
@@ -342,6 +360,8 @@ class AsyncStageTracker:
             phase = self._start_phases.setdefault(stage, {}).pop(key, None)
             elapsed_s = max(0.0, timestamp_s - started_at)
             self.stage_waits.setdefault(stage, TimeStats()).record(elapsed_s)
+            if phase is not None:
+                self.stage_waits_by_phase.setdefault(phase, {}).setdefault(stage, TimeStats()).record(elapsed_s)
             return elapsed_s, phase
 
     def record_disk_io(self, bytes_count: int, elapsed_s: float, phase: str | None = None) -> None:
@@ -459,6 +479,13 @@ class AsyncStageTracker:
                     name: stats.to_dict()
                     for name, stats in sorted(self.public_methods.items())
                 },
+                "public_methods_by_phase": {
+                    phase: {
+                        name: stats.to_dict()
+                        for name, stats in sorted(method_stats.items())
+                    }
+                    for phase, method_stats in sorted(self.public_methods_by_phase.items())
+                },
                 "scheduler_methods": {
                     name: stats.to_dict()
                     for name, stats in sorted(self.scheduler_methods.items())
@@ -466,6 +493,13 @@ class AsyncStageTracker:
                 "stage_waits": {
                     name: stats.to_dict()
                     for name, stats in sorted(self.stage_waits.items())
+                },
+                "stage_waits_by_phase": {
+                    phase: {
+                        name: stats.to_dict()
+                        for name, stats in sorted(stage_stats.items())
+                    }
+                    for phase, stage_stats in sorted(self.stage_waits_by_phase.items())
                 },
                 "wait_reasons": {
                     name: stats.to_dict()

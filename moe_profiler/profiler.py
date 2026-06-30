@@ -355,7 +355,7 @@ class Profiler:
             started_at = time.perf_counter()
             result = original_is_ready(*args, **kwargs)
             elapsed_s = time.perf_counter() - started_at
-            self._stage_tracker.record_public_method("is_expert_ready", elapsed_s)
+            self._stage_tracker.record_public_method("is_expert_ready", elapsed_s, self._phase[0])
             if will_count_gpu_hit and result:
                 self._cache_tracker.record("gpu", key[0])
             return result
@@ -378,7 +378,7 @@ class Profiler:
                 enter_counts=enter_counts,
                 enter_states=enter_states,
             )
-            self._stage_tracker.record_public_method("wait_any_ready", elapsed_s)
+            self._stage_tracker.record_public_method("wait_any_ready", elapsed_s, self._phase[0])
             self._stage_tracker.record_wait_any_ready(
                 layer_idx=layer_idx,
                 pending_count=len(expert_ids),
@@ -401,7 +401,7 @@ class Profiler:
             started_at = time.perf_counter()
             result = original_release(*args, **kwargs)
             elapsed_s = time.perf_counter() - started_at
-            self._stage_tracker.record_public_method("release_expert", elapsed_s)
+            self._stage_tracker.record_public_method("release_expert", elapsed_s, self._phase[0])
             self._stage_tracker.start_stage("compute_pending", key, time.perf_counter(), self._phase[0])
             return result
 
@@ -416,7 +416,7 @@ class Profiler:
             started_at = time.perf_counter()
             result = original(*args, **kwargs)
             elapsed_s = time.perf_counter() - started_at
-            self._stage_tracker.record_public_method(method_name, elapsed_s)
+            self._stage_tracker.record_public_method(method_name, elapsed_s, self._phase[0])
             return result
 
         setattr(cache_manager, method_name, wrapper)
