@@ -68,6 +68,9 @@ class _ExpertRequest:
     # 调度阶段：waiting_cpu、loading_cpu、waiting_gpu、loading_gpu、ready、compute_pending。
     stage: str
 
+    # True 表示低优先级预取；真实 block 请求到达后会原地提升为 demand。
+    is_prefetch: bool = False
+
     # CPU/GPU slot 下标，以及发起异步任务时对应的 generation。
     cpu_slot_idx: int | None = None
     gpu_slot_idx: int | None = None
@@ -91,10 +94,11 @@ class asyncExpertCacheManager:
     """异步 routed expert 缓存管理器。
 
     设计边界：
-    - block 只调用 request_expert / is_expert_ready / wait_any_ready / get_ready_expert / release_expert。
+    - block 调用 demand 接口，Prefetcher 只调用 prefetch_experts。
     - CacheManager 独立维护 CPU/GPU slot 四状态，并由后台调度线程推进磁盘读取和 H2D 拷贝。
     - GPU 上已经命中的 expert 会直接 protected，然后交给 block 立刻计算。
     - GPU 上未命中的 expert 会排队加载；加载完成后状态变为 protected，保证马上计算前不会被 LRU 覆盖。
+    - 预取使用独立低优先级队列，完成后只进入 used，不进入 ready 或 compute_pending。
     """
 
     def __init__(
@@ -105,7 +109,13 @@ class asyncExpertCacheManager:
         tensor_loader: ManifestTensorLoader,
         model_config: Any | None = None,
     ) -> None:
-        """初始化缓存布局、异步调度队列和后台调度线程。"""
+        """
+        初始化缓存布局、异步调度队列和后台调度线程。
+
+        输入：运行配置、模型 Adapter、张量加载器和模型配置。
+        输出：无。
+        功能：建立 demand/预取队列、CPU/GPU 连续 buffer、磁盘线程池和 H2D 调度 stream。
+        """
 
         # 保存运行期依赖。adapter 负责专家权重命名，loader 负责按 manifest 读权重。
         self.config = runtime_config
@@ -147,6 +157,12 @@ class asyncExpertCacheManager:
         self._loading_gpu: set[ExpertKey] = set()
         self._ready: set[ExpertKey] = set()
         self._compute_pending: set[ExpertKey] = set()
+
+        # 预取使用独立低优先级队列，不进入 ready 或 compute_pending。
+        self._prefetch_waiting_cpu: deque[ExpertKey] = deque()
+        self._prefetch_waiting_gpu: deque[ExpertKey] = deque()
+        self._prefetch_loading_cpu: set[ExpertKey] = set()
+        self._prefetch_loading_gpu: set[ExpertKey] = set()
 
         # 根据第一个可用 routed expert 探测每个 expert 的展平大小、切分布局和 dtype。
         self._expert_elems, self._expert_layout, self._expert_dtype = self._probe_expert()
@@ -221,21 +237,79 @@ class asyncExpertCacheManager:
             self._cv.notify_all()
 
     def request_expert(self, layer_idx: int, expert_idx: int) -> None:
-        """提交一个 expert 需求。
+        """
+        提交一个当前 block 必须使用的 expert 请求。
 
-        这个函数只负责把需求放入合适的状态或队列：
-        - GPU 命中：used -> protected，并加入 ready。
-        - CPU 命中：CPU used -> protected，并加入 waiting_gpu。
-        - CPU/GPU 都未命中：加入 waiting_cpu，等待磁盘回源。
+        输入：目标 transformer 层编号和 expert 编号。
+        输出：无。
+        功能：按 GPU、CPU、磁盘顺序定位 expert；若同一 expert 正在预取，则提升为高优先级 demand。
         """
 
         key = (layer_idx, expert_idx)
         with self._cv:
             self._raise_if_error(key)
 
-            # 已经有同一个 expert 的请求时，不重复入队；后台调度器会继续推进原请求。
-            if key not in self._requests:
+            req = self._requests.get(key)
+            if req is None:
                 self._enqueue_request(key)
+            elif req.is_prefetch:
+                # 真实路由命中预取任务时复用已有 I/O，避免再次读取同一个 expert。
+                self._promote_prefetch_request_locked(key, req)
+
+            self._cv.notify_all()
+
+    def prefetch_experts(self, layer_idx: int, expert_ids: list[int]) -> None:
+        """
+        提交一组未来层预测 expert 的低优先级预取请求。
+
+        输入：目标 transformer 层编号和预测 expert 编号列表。
+        输出：无。
+        功能：跳过已缓存或已调度的 expert，其余请求进入独立预取队列并由后台调度器非阻塞推进。
+        """
+
+        with self._cv:
+            for expert_idx in expert_ids:
+                key = (layer_idx, int(expert_idx))
+
+                # demand 或先前预取已经覆盖该 key 时，不重复创建磁盘/H2D 任务。
+                if key in self._requests:
+                    continue
+
+                gpu_slot_idx = self._find_expert_in_slots(
+                    self._gpu_slots,
+                    self._gpu_layer_slot_map,
+                    layer_idx,
+                    int(expert_idx),
+                )
+                if gpu_slot_idx is not None:
+                    continue
+
+                cpu_slot_idx = self._find_expert_in_slots(
+                    self._cpu_slots,
+                    self._cpu_layer_slot_map,
+                    layer_idx,
+                    int(expert_idx),
+                )
+                if cpu_slot_idx is not None:
+                    cpu_slot = self._cpu_slots[cpu_slot_idx]
+                    self._requests[key] = _ExpertRequest(
+                        layer_idx=layer_idx,
+                        expert_idx=int(expert_idx),
+                        stage="prefetch_waiting_gpu",
+                        is_prefetch=True,
+                        cpu_slot_idx=cpu_slot_idx,
+                        cpu_generation=cpu_slot.generation,
+                    )
+                    self._prefetch_waiting_gpu.append(key)
+                    continue
+
+                self._requests[key] = _ExpertRequest(
+                    layer_idx=layer_idx,
+                    expert_idx=int(expert_idx),
+                    stage="prefetch_waiting_cpu",
+                    is_prefetch=True,
+                )
+                self._prefetch_waiting_cpu.append(key)
 
             self._cv.notify_all()
 
@@ -392,10 +466,12 @@ class asyncExpertCacheManager:
                     self._cv.wait(timeout=_SCHEDULER_WAIT_SECONDS)
 
     def _pump(self) -> bool:
-        """执行一次非阻塞调度 tick。
+        """
+        执行一次非阻塞调度 tick。
 
-        调用方必须持有 self._cv。
-        返回 True 表示至少推进了一个状态，调用方可以唤醒等待 ready 的 block。
+        输入：无；调用方必须已经持有 self._cv。
+        输出：至少一个请求或 slot 状态发生推进时返回 True。
+        功能：先推进 demand，再利用剩余磁盘和 H2D 能力推进低优先级预取。
         """
 
         progressed = False
@@ -409,11 +485,19 @@ class asyncExpertCacheManager:
         # 再检查磁盘读取完成，把 loading CPU slot 转为 protected，并放入 waiting_gpu。
         progressed |= self._complete_finished_disk_reads_locked()
 
+        # 预取完成只生成 used 缓存，不会进入当前 block 可见的 ready 集合。
+        progressed |= self._complete_finished_prefetch_h2d_locked()
+        progressed |= self._complete_finished_prefetch_disk_reads_locked()
+
         # 优先调度 CPU -> GPU，让 CPU hit 或刚读完磁盘的 expert 尽快可算。
         progressed |= self._schedule_h2d_locked()
 
         # 最后补充磁盘回源任务，持续填充 CPU cache。
         progressed |= self._schedule_disk_reads_locked()
+
+        # 只有 demand 队列获得优先调度后，才允许预取占用剩余 I/O 资源。
+        progressed |= self._schedule_prefetch_h2d_locked()
+        progressed |= self._schedule_prefetch_disk_reads_locked()
 
         if progressed:
             self._cv.notify_all()
@@ -575,6 +659,119 @@ class asyncExpertCacheManager:
 
         return progressed
 
+    def _complete_finished_prefetch_h2d_locked(self) -> bool:
+        """
+        检查低优先级预取 H2D 是否完成。
+
+        输入：无；调用方必须已经持有 self._cv。
+        输出：至少一个预取请求完成时返回 True。
+        功能：把预取目标 GPU slot 从 loading 转为 used，并释放 CPU 源 slot，不进入 ready 状态。
+        """
+
+        progressed = False
+        for key in list(self._prefetch_loading_gpu):
+            req = self._requests.get(key)
+            if req is None:
+                raise RuntimeError(f"Prefetch loading GPU expert has no request: {key}")
+
+            if not req.is_prefetch or req.stage != "prefetch_loading_gpu":
+                raise RuntimeError(
+                    f"Prefetch loading GPU expert has invalid request: {key}, "
+                    f"stage={req.stage}, is_prefetch={req.is_prefetch}"
+                )
+
+            if req.h2d_event is not None and not req.h2d_event.query():
+                continue
+
+            if req.gpu_slot_idx is None or req.cpu_slot_idx is None:
+                raise RuntimeError(f"Prefetch loading GPU expert has incomplete slots: {key}")
+
+            gpu_slot = self._gpu_slots[req.gpu_slot_idx]
+            if (
+                gpu_slot.generation != req.gpu_generation
+                or gpu_slot.status != "loading"
+                or gpu_slot.layer_idx != req.layer_idx
+                or gpu_slot.expert_idx != req.expert_idx
+            ):
+                raise RuntimeError(f"Prefetch loading GPU slot state is invalid: {key}")
+
+            cpu_slot = self._cpu_slots[req.cpu_slot_idx]
+            if (
+                cpu_slot.generation != req.cpu_generation
+                or cpu_slot.status != "protected"
+                or cpu_slot.layer_idx != req.layer_idx
+                or cpu_slot.expert_idx != req.expert_idx
+            ):
+                raise RuntimeError(f"Prefetch H2D CPU source slot state is invalid: {key}")
+
+            # 预取结果尚未被真实路由使用，LFU 访问次数保持 0，使无效预取优先被覆盖。
+            self._reset_slot_usage(gpu_slot)
+            gpu_slot.access_count = 0
+            cpu_slot.status = "used"
+            cpu_slot.last_used_step = self._global_step
+
+            self._prefetch_loading_gpu.discard(key)
+            self._requests.pop(key)
+            progressed = True
+
+        return progressed
+
+    def _complete_finished_prefetch_disk_reads_locked(self) -> bool:
+        """
+        检查低优先级预取磁盘读取是否完成。
+
+        输入：无；调用方必须已经持有 self._cv。
+        输出：至少一个预取磁盘任务完成时返回 True。
+        功能：把完整 expert 留在 CPU used slot，并排入低优先级 H2D 队列。
+        """
+
+        progressed = False
+        for key in list(self._prefetch_loading_cpu):
+            req = self._requests.get(key)
+            if req is None:
+                raise RuntimeError(f"Prefetch loading CPU expert has no request: {key}")
+
+            if not req.is_prefetch or req.stage != "prefetch_loading_cpu":
+                raise RuntimeError(
+                    f"Prefetch loading CPU expert has invalid request: {key}, "
+                    f"stage={req.stage}, is_prefetch={req.is_prefetch}"
+                )
+
+            if req.disk_future is None:
+                raise RuntimeError(f"Prefetch loading CPU expert has no disk future: {key}")
+
+            if not req.disk_future.done():
+                continue
+
+            try:
+                req.disk_future.result()
+            except BaseException as exc:
+                raise RuntimeError(f"Prefetch disk read failed for expert {key}") from exc
+
+            if req.cpu_slot_idx is None:
+                raise RuntimeError(f"Prefetch loading CPU expert has no CPU slot: {key}")
+
+            cpu_slot = self._cpu_slots[req.cpu_slot_idx]
+            if (
+                cpu_slot.generation != req.cpu_generation
+                or cpu_slot.status != "loading"
+                or cpu_slot.layer_idx != req.layer_idx
+                or cpu_slot.expert_idx != req.expert_idx
+            ):
+                raise RuntimeError(f"Prefetch loading CPU slot state is invalid: {key}")
+
+            # 等待低优先级 H2D 时保持 used，使 demand 有权按缓存策略覆盖这次预测结果。
+            self._reset_slot_usage(cpu_slot)
+            cpu_slot.access_count = 0
+            req.stage = "prefetch_waiting_gpu"
+            req.disk_future = None
+
+            self._prefetch_loading_cpu.discard(key)
+            self._prefetch_waiting_gpu.append(key)
+            progressed = True
+
+        return progressed
+
     def _schedule_h2d_locked(self) -> bool:
         """为 waiting_gpu 队列调度 CPU -> GPU 拷贝。
 
@@ -694,6 +891,152 @@ class asyncExpertCacheManager:
 
         return progressed
 
+    def _schedule_prefetch_h2d_locked(self) -> bool:
+        """
+        利用 demand H2D 之后的空闲机会提交一次预取 H2D。
+
+        输入：无；调用方必须已经持有 self._cv。
+        输出：提交或丢弃至少一个预取请求时返回 True。
+        功能：正常 waiting_gpu 优先，预取同时最多一个 H2D；CPU 源已被覆盖时直接放弃该预取。
+        """
+
+        if self._waiting_gpu or self._prefetch_loading_gpu:
+            return False
+
+        progressed = False
+        while self._prefetch_waiting_gpu:
+            key = self._prefetch_waiting_gpu[0]
+            req = self._requests.get(key)
+            if req is None:
+                raise RuntimeError(f"Prefetch waiting GPU expert has no request: {key}")
+
+            if not req.is_prefetch or req.stage != "prefetch_waiting_gpu":
+                raise RuntimeError(
+                    f"Prefetch waiting GPU expert has invalid request: {key}, "
+                    f"stage={req.stage}, is_prefetch={req.is_prefetch}"
+                )
+
+            if req.cpu_slot_idx is None:
+                raise RuntimeError(f"Prefetch waiting GPU expert has no CPU source slot: {key}")
+
+            cpu_slot = self._cpu_slots[req.cpu_slot_idx]
+            source_is_valid = (
+                cpu_slot.generation == req.cpu_generation
+                and cpu_slot.status == "used"
+                and cpu_slot.layer_idx == req.layer_idx
+                and cpu_slot.expert_idx == req.expert_idx
+            )
+            if not source_is_valid:
+                # 预取等待期间允许 CPU LRU 覆盖预测结果；此时放弃即可，不进行低优先级重读。
+                self._prefetch_waiting_gpu.popleft()
+                self._requests.pop(key)
+                progressed = True
+                continue
+
+            gpu_slot_idx = self._pick_slot(
+                self._gpu_slots,
+                self._gpu_layer_slot_map,
+                req.layer_idx,
+            )
+            if gpu_slot_idx is None:
+                return progressed
+
+            self._prefetch_waiting_gpu.popleft()
+            gpu_slot = self._gpu_slots[gpu_slot_idx]
+
+            # H2D 期间 CPU 源和 GPU 目标都不可覆盖，完成后两者都会恢复为 used。
+            cpu_slot.status = "protected"
+            gpu_slot.layer_idx = req.layer_idx
+            gpu_slot.expert_idx = req.expert_idx
+            gpu_slot.status = "loading"
+            gpu_slot.generation += 1
+
+            req.gpu_slot_idx = gpu_slot_idx
+            req.gpu_generation = gpu_slot.generation
+            req.stage = "prefetch_loading_gpu"
+
+            if self._is_cuda_target:
+                assert self._h2d_stream is not None
+                with torch.cuda.stream(self._h2d_stream):
+                    self._gpu_buffer[gpu_slot_idx, :].copy_(
+                        self._cpu_buffer[req.cpu_slot_idx, :],
+                        non_blocking=True,
+                    )
+                    event = torch.cuda.Event()
+                    event.record(self._h2d_stream)
+                req.h2d_event = event
+            else:
+                self._gpu_buffer[gpu_slot_idx, :].copy_(
+                    self._cpu_buffer[req.cpu_slot_idx, :]
+                )
+                req.h2d_event = None
+
+            self._prefetch_loading_gpu.add(key)
+            return True
+
+        return progressed
+
+    def _schedule_prefetch_disk_reads_locked(self) -> bool:
+        """
+        利用 demand 磁盘任务之外的 worker 提交低优先级预取读取。
+
+        输入：无；调用方必须已经持有 self._cv。
+        输出：至少提交一个预取磁盘任务时返回 True。
+        功能：正常 waiting_cpu 优先，并始终为后续真实请求保留至少一个磁盘 worker。
+        """
+
+        if self._waiting_cpu:
+            return False
+
+        progressed = False
+        prefetch_worker_limit = max(0, _MAX_DISK_WORKERS - 1)
+        while (
+            self._prefetch_waiting_cpu
+            and len(self._prefetch_loading_cpu) < prefetch_worker_limit
+            and len(self._loading_cpu) + len(self._prefetch_loading_cpu) < _MAX_DISK_WORKERS
+        ):
+            key = self._prefetch_waiting_cpu[0]
+            req = self._requests.get(key)
+            if req is None:
+                raise RuntimeError(f"Prefetch waiting CPU expert has no request: {key}")
+
+            if not req.is_prefetch or req.stage != "prefetch_waiting_cpu":
+                raise RuntimeError(
+                    f"Prefetch waiting CPU expert has invalid request: {key}, "
+                    f"stage={req.stage}, is_prefetch={req.is_prefetch}"
+                )
+
+            cpu_slot_idx = self._pick_slot(
+                self._cpu_slots,
+                self._cpu_layer_slot_map,
+                req.layer_idx,
+            )
+            if cpu_slot_idx is None:
+                return progressed
+
+            self._prefetch_waiting_cpu.popleft()
+            cpu_slot = self._cpu_slots[cpu_slot_idx]
+            cpu_slot.layer_idx = req.layer_idx
+            cpu_slot.expert_idx = req.expert_idx
+            cpu_slot.status = "loading"
+            cpu_slot.generation += 1
+
+            req.cpu_slot_idx = cpu_slot_idx
+            req.cpu_generation = cpu_slot.generation
+            req.stage = "prefetch_loading_cpu"
+
+            spec = self.adapter.routed_expert_weight_name(req.layer_idx, req.expert_idx)
+            req.disk_future = self._disk_pool.submit(
+                self.loader.load_tensors_to_buffer,
+                tensor_names=list(spec.values()),
+                buffer=self._cpu_buffer,
+                slot_idx=cpu_slot_idx,
+            )
+            self._prefetch_loading_cpu.add(key)
+            progressed = True
+
+        return progressed
+
     def _enqueue_request(self, key: ExpertKey) -> None:
         """按 GPU hit、CPU hit、disk miss 的顺序把请求放入调度系统。
 
@@ -755,6 +1098,77 @@ class asyncExpertCacheManager:
             stage="waiting_cpu",
         )
         self._waiting_cpu.append(key)
+
+    def _promote_prefetch_request_locked(
+        self,
+        key: ExpertKey,
+        req: _ExpertRequest,
+    ) -> None:
+        """
+        将正在等待或加载的预取请求提升为真实 demand。
+
+        输入：expert 唯一键和对应的预取请求对象；调用方必须已经持有 self._cv。
+        输出：无。
+        功能：复用预取已经完成的 I/O，并把后续状态流转切换到正常 ready/compute 路径。
+        """
+
+        if not req.is_prefetch:
+            raise RuntimeError(f"Cannot promote a non-prefetch request: {key}")
+
+        if req.stage == "prefetch_waiting_cpu":
+            self._prefetch_waiting_cpu.remove(key)
+            req.is_prefetch = False
+            req.stage = "waiting_cpu"
+            self._waiting_cpu.append(key)
+            return
+
+        if req.stage == "prefetch_loading_cpu":
+            self._prefetch_loading_cpu.discard(key)
+            self._loading_cpu.add(key)
+            req.is_prefetch = False
+            req.stage = "loading_cpu"
+            return
+
+        if req.stage == "prefetch_waiting_gpu":
+            self._prefetch_waiting_gpu.remove(key)
+
+            if req.cpu_slot_idx is None:
+                raise RuntimeError(f"Prefetch waiting GPU expert has no CPU slot: {key}")
+
+            cpu_slot = self._cpu_slots[req.cpu_slot_idx]
+            source_is_valid = (
+                cpu_slot.generation == req.cpu_generation
+                and cpu_slot.status == "used"
+                and cpu_slot.layer_idx == req.layer_idx
+                and cpu_slot.expert_idx == req.expert_idx
+            )
+
+            req.is_prefetch = False
+            if source_is_valid:
+                # demand 接管 CPU 命中后立即保护源 slot，确保 H2D 前不会被缓存策略覆盖。
+                self._touch_slot(cpu_slot)
+                cpu_slot.status = "protected"
+                req.stage = "waiting_gpu"
+                self._waiting_gpu.append(key)
+                return
+
+            # 低优先级等待期间 CPU slot 可以被覆盖；真实请求此时回到磁盘 demand 队列。
+            req.cpu_slot_idx = None
+            req.cpu_generation = None
+            req.stage = "waiting_cpu"
+            self._waiting_cpu.append(key)
+            return
+
+        if req.stage == "prefetch_loading_gpu":
+            self._prefetch_loading_gpu.discard(key)
+            self._loading_gpu.add(key)
+            req.is_prefetch = False
+            req.stage = "loading_gpu"
+            return
+
+        raise RuntimeError(
+            f"Prefetch request cannot be promoted from stage: {key}, stage={req.stage}"
+        )
 
     # ==================================================================
     # request 和 slot 辅助函数
@@ -966,15 +1380,12 @@ class asyncExpertCacheManager:
         return offset, layer_slot_map
 
     def close(self) -> None:
-        """关闭后台调度资源，并等待异步任务不再持有 cache buffer。
+        """
+        关闭后台调度资源并释放缓存 buffer。
 
-        async CacheManager 里同时存在三类后台工作：
-        - 调度线程：负责提交磁盘读取和 H2D 拷贝。
-        - 磁盘线程池：可能正在把 expert 写入 pinned CPU buffer。
-        - H2D CUDA stream：可能正在从 CPU buffer 拷贝到 GPU buffer。
-
-        如果 close 只发出停止信号而不等待这些任务结束，下一次运行马上分配新的
-        pinned CPU buffer 时，上一轮 buffer 仍可能被后台任务持有，从而触发 OOM。
+        输入：无。
+        输出：无。
+        功能：停止调度线程，等待磁盘/H2D 任务完成，再清空 demand、预取队列和大块缓存引用。
         """
 
         if getattr(self, "_closed", False):
@@ -1010,6 +1421,10 @@ class asyncExpertCacheManager:
         self._loading_gpu.clear()
         self._ready.clear()
         self._compute_pending.clear()
+        self._prefetch_waiting_cpu.clear()
+        self._prefetch_waiting_gpu.clear()
+        self._prefetch_loading_cpu.clear()
+        self._prefetch_loading_gpu.clear()
 
     def __del__(self) -> None:
         """对象析构时尽量释放后台线程资源。"""

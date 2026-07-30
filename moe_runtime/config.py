@@ -10,6 +10,8 @@ from pathlib import Path
 class RuntimeConfig:
     """MoE Runtime 的顶层配置。
 
+    该配置集中描述模型路径、设备、缓存容量、缓存策略和预取策略，
+    由 RuntimeEngine、CacheManager 和 Adapter 在组件装配阶段共同读取。
     """
     # 本地模型目录，例如 models/Qwen1.5-Moe-A2.7B。
     model_dir: str | Path
@@ -38,6 +40,9 @@ class RuntimeConfig:
     # 预取策略。
     prefetch_policy: str = "none"
 
+    # Gate 预取向后预测的 MoE 层数量；普通 MLP 层不计入距离。
+    prefetch_distance: int = 1
+
     # CPU 缓存容量上限
     max_cpu_cache_capacity: dict[int, int] = None
 
@@ -45,10 +50,28 @@ class RuntimeConfig:
     max_gpu_cache_capacity: dict[int, int] = None
 
     def __post_init__(self) -> None:
-        """规范化路径字段，保证 RuntimeEngine 内部拿到的是 Path。"""
+        """
+        校验运行配置并规范化模型路径。
+
+        输入：当前 RuntimeConfig 实例中的配置字段。
+        输出：无。
+        功能：校验缓存和预取模式，并把模型目录及 manifest 路径统一转换为绝对 Path。
+        """
 
         if self.cache_policy not in {"lru", "lfu"}:
             raise ValueError(f"Unsupported cache_policy: {self.cache_policy}. Expected 'lru' or 'lfu'.")
+
+        if self.prefetch_policy not in {"none", "gate"}:
+            raise ValueError(
+                f"Unsupported prefetch_policy: {self.prefetch_policy}. "
+                "Expected 'none' or 'gate'."
+            )
+
+        if self.prefetch_distance < 1:
+            raise ValueError("prefetch_distance must be greater than or equal to 1.")
+
+        if self.prefetch_policy == "gate" and self.cache_manager_mode != "async":
+            raise ValueError("Gate prefetch requires cache_manager_mode='async'.")
 
         # model_dir 是必填项，统一转换为绝对路径。
         self.model_dir = Path(self.model_dir).resolve()

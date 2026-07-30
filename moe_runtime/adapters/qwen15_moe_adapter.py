@@ -22,10 +22,16 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from .base import MoeModelAdapter
 from moe_runtime.blocks import Qwen2OnDemandExperts
 from moe_runtime.blocks import asyncQwen2OnDemandExperts
+from moe_runtime.blocks import patch_qwen2_prefetch
+from moe_runtime.prefetcher import Qwen2GatePrefetcher
 
 
 class Qwen15MoeAdapter(MoeModelAdapter):
-    """Qwen1.5-MoE-A2.7B 适配器。"""
+    """Qwen1.5-MoE-A2.7B 模型适配器。
+
+    该类负责 Qwen routed expert 权重命名、专家层识别、空模型构造，
+    以及串行/异步 experts 与 Qwen gate 预取 hook 的模型装配。
+    """
 
     supported_model_types: list[str] = ["qwen2_moe"]
 
@@ -88,15 +94,22 @@ class Qwen15MoeAdapter(MoeModelAdapter):
         cache_manager: Any | None = None,
         prefetcher: Any | None = None,
     ) -> nn.Module:
-        """只替换 Qwen sparse MoE block 内部的 routed experts。"""
+        """
+        替换 Qwen routed experts，并按配置注册未来 gate 预取 hook。
+
+        输入：空模型、Qwen 配置、CacheManager 和可选外部 Prefetcher。
+        输出：完成 routed experts 替换和可选预取 patch 的模型。
+        功能：保留原始 gate/shared expert，只替换 experts；gate 预取仅在异步模式下启用。
+        """
 
         # Qwen2MoeForCausalLM 的 decoder layers 通常位于 model.model.layers。
         layers = model.model.layers
 
         # 串行/异步体系共用同一个 adapter；根据 CacheManager 暴露的接口选择专家模块。
+        use_async_experts = self._use_sync_experts(cache_manager)
         expert_cls = (
             asyncQwen2OnDemandExperts
-            if self._use_sync_experts(cache_manager)
+            if use_async_experts
             else Qwen2OnDemandExperts
         )
 
@@ -114,6 +127,31 @@ class Qwen15MoeAdapter(MoeModelAdapter):
                 layer_idx=layer_idx,
                 cache_manager=cache_manager,
                 prefetcher=prefetcher,
+            )
+
+        runtime_config = getattr(cache_manager, "config", None)
+        if (
+            use_async_experts
+            and runtime_config is not None
+            and runtime_config.prefetch_policy == "gate"
+        ):
+            routed_expert_layers = self.routed_expert_layers(model_config)
+            moe_blocks = {
+                layer_idx: layers[layer_idx].mlp
+                for layer_idx in routed_expert_layers
+            }
+            gate_prefetcher = Qwen2GatePrefetcher(
+                cache_manager=cache_manager,
+                moe_blocks=moe_blocks,
+                routed_expert_layers=routed_expert_layers,
+                prefetch_distance=runtime_config.prefetch_distance,
+            )
+
+            # Hook 只旁路读取原 MoE 输入，现有异步 experts 的请求和计算逻辑保持不变。
+            patch_qwen2_prefetch(
+                model=model,
+                routed_expert_layers=routed_expert_layers,
+                prefetcher=gate_prefetcher,
             )
 
         return model

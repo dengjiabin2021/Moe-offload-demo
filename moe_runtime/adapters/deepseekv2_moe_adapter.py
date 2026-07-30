@@ -18,10 +18,16 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from .base import MoeModelAdapter
 from moe_runtime.blocks import DeepseekV2OnDemandExperts
 from moe_runtime.blocks import asyncDeepseekV2OnDemandExperts
+from moe_runtime.blocks import patch_deepseekv2_prefetch
+from moe_runtime.prefetcher import DeepseekV2GatePrefetcher
 
 
 class DeepseekV2MoeAdapter(MoeModelAdapter):
-    """DeepSeek-V2-Lite MoE 适配器。"""
+    """DeepSeek-V2-Lite 模型适配器。
+
+    该类负责 DeepSeek routed expert 权重命名、专家层识别、空模型构造，
+    以及串行/异步 experts 与 DeepSeek gate 预取 hook 的模型装配。
+    """
 
     supported_model_types: list[str] = ["deepseek_v2"]
 
@@ -93,15 +99,22 @@ class DeepseekV2MoeAdapter(MoeModelAdapter):
         cache_manager: Any | None = None,
         prefetcher: Any | None = None,
     ) -> nn.Module:
-        """只替换 DeepSeek-V2 MoE block 内部的 routed experts。"""
+        """
+        替换 DeepSeek-V2 routed experts，并按配置注册未来 gate 预取 hook。
+
+        输入：空模型、DeepSeek-V2 配置、CacheManager 和可选外部 Prefetcher。
+        输出：完成 routed experts 替换和可选预取 patch 的模型。
+        功能：保留原始 gate/shared experts，只替换 experts；普通 MLP 层不会注册预取 hook。
+        """
 
         # DeepseekV2ForCausalLM 的 decoder layers 通常位于 model.model.layers。
         layers = model.model.layers
 
         # 串行/异步体系共用同一个 adapter；根据 CacheManager 暴露的接口选择专家模块。
+        use_async_experts = self._use_sync_experts(cache_manager)
         expert_cls = (
             asyncDeepseekV2OnDemandExperts
-            if self._use_sync_experts(cache_manager)
+            if use_async_experts
             else DeepseekV2OnDemandExperts
         )
 
@@ -118,6 +131,31 @@ class DeepseekV2MoeAdapter(MoeModelAdapter):
                 layer_idx=layer_idx,
                 cache_manager=cache_manager,
                 prefetcher=prefetcher,
+            )
+
+        runtime_config = getattr(cache_manager, "config", None)
+        if (
+            use_async_experts
+            and runtime_config is not None
+            and runtime_config.prefetch_policy == "gate"
+        ):
+            routed_expert_layers = self.routed_expert_layers(model_config)
+            moe_blocks = {
+                layer_idx: layers[layer_idx].mlp
+                for layer_idx in routed_expert_layers
+            }
+            gate_prefetcher = DeepseekV2GatePrefetcher(
+                cache_manager=cache_manager,
+                moe_blocks=moe_blocks,
+                routed_expert_layers=routed_expert_layers,
+                prefetch_distance=runtime_config.prefetch_distance,
+            )
+
+            # DeepSeek 第 0 层等普通 MLP 不在 routed_expert_layers 中，不会注册 hook。
+            patch_deepseekv2_prefetch(
+                model=model,
+                routed_expert_layers=routed_expert_layers,
+                prefetcher=gate_prefetcher,
             )
 
         return model
