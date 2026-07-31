@@ -22,6 +22,14 @@ class asyncDeepseekV2OnDemandExperts(nn.Module):
         cache_manager: Any | None = None,
         prefetcher: Any | None = None,
     ) -> None:
+        """
+        初始化 DeepSeek 异步按需专家集合。
+
+        输入：模型配置、当前层号、异步 CacheManager 和当前层 gate 预取模块。
+        输出：无。
+        功能：保存专家计算结构和调度依赖；预取模块只负责当前层之后的专家预测。
+        """
+
         super().__init__()
 
         # DeepSeek-V2 配置中的 routed expert 数量，用于构造 one_hot 命中表。
@@ -40,7 +48,7 @@ class asyncDeepseekV2OnDemandExperts(nn.Module):
         # 模型级异步缓存管理器，负责 expert 请求、ready 查询、权重 view 获取和 release。
         self.cache_manager = cache_manager
 
-        # 预取器接口暂时保留，后续可接入跨层/跨 token 的预取策略。
+        # 每个 routed 层持有自己的预取器，目标范围已按模型尾部截断。
         self.prefetcher = prefetcher
 
     def forward(
@@ -49,9 +57,12 @@ class asyncDeepseekV2OnDemandExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        """执行 routed experts 计算。
+        """
+        执行 DeepSeek routed experts 的异步计算。
 
-        输入参数与 transformers 官方 DeepseekV2Experts.forward 保持一致。
+        输入：token hidden_states、top-k expert 编号和对应路由权重。
+        输出：所有命中 routed experts 加权累加后的 hidden_states。
+        功能：先原子登记当前层全部真实 demand，再提交未来 gate 预测并按 ready/pending 状态计算。
         """
 
         if self.cache_manager is None:
@@ -81,6 +92,16 @@ class asyncDeepseekV2OnDemandExperts(nn.Module):
                 continue
             active_experts.append(expert_id)
 
+        # 当前层真实 gate 结果必须先整体对账，避免未来预取抢在 demand 登记前占用调度资源。
+        self.cache_manager.request_experts(
+            layer_idx=self.layer_idx,
+            expert_ids=active_experts,
+        )
+
+        # demand 已完整可见后再计算未来层预测；预测只消费 hidden_states，不修改本层输出。
+        if self.prefetcher is not None:
+            self.prefetcher.prefetch(hidden_states)
+
         # ready 表示 GPU 上已经可直接计算的 expert。
         ready: list[int] = []
 
@@ -91,11 +112,7 @@ class asyncDeepseekV2OnDemandExperts(nn.Module):
             if self.cache_manager.is_expert_ready(layer_idx=self.layer_idx, expert_idx=expert_id):
                 ready.append(expert_id)
             else:
-                # 不 ready 的 expert 只提交一次请求；后续磁盘/CPU/GPU 调度由 CacheManager 接管。
-                self.cache_manager.request_expert(
-                    layer_idx=self.layer_idx,
-                    expert_idx=expert_id,
-                )
+                # 整批 demand 已经登记，不 ready 仅表示后台仍在执行磁盘读取或 H2D。
                 pending.append(expert_id)
 
         # 只要还有可计算或待加载的 expert，就持续推进本层 routed experts 计算。

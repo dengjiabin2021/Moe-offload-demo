@@ -65,8 +65,20 @@ class MoeModelAdapter(ABC):
         """返回包含 routed experts 的 transformer layer 索引。"""
 
     @abstractmethod
-    def patch_moe_block(self, model: nn.Module) -> nn.Module:
-        """将原始 MoE block替换"""
+    def patch_moe_block(
+        self,
+        model: nn.Module,
+        model_config: Any,
+        runtime_config: RuntimeConfig,
+        cache_manager: Any | None = None,
+    ) -> nn.Module:
+        """
+        替换模型中的 routed experts。
+
+        输入：空模型、模型配置、运行时配置和 CacheManager。
+        输出：完成 routed experts 替换的模型。
+        功能：子类只负责按模型结构执行模块替换，不在这里注册运行期 hook。
+        """
 
     @abstractmethod
     def materialize_meta_tensors(self, model: nn.Module, target_device: torch.device) -> None:

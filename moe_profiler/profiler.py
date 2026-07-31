@@ -3,7 +3,7 @@
 Profiler 只通过运行期 monkeypatch 采集指标，不修改 ``moe_runtime`` 的逻辑代码。
 它面向当前异步接口：
 
-- ``request_expert``
+- ``request_experts``
 - ``is_expert_ready``
 - ``wait_any_ready``
 - ``get_ready_expert``
@@ -332,18 +332,30 @@ class Profiler:
 
     @staticmethod
     def _disk_worker_capacity(cache_manager: Any) -> int:
-        """读取 async CacheManager 实际磁盘线程池容量。"""
+        """
+        读取 async CacheManager 的 demand 磁盘线程池容量。
 
-        disk_pool = getattr(cache_manager, "_disk_pool", None)
+        输入：异步 CacheManager。
+        输出：demand 磁盘 worker 数量。
+        功能：Profiler 只用真实 demand 并发估算关键路径，不把独立低优先级预取 worker 混入。
+        """
+
+        disk_pool = getattr(cache_manager, "_demand_disk_pool", None)
         max_workers = getattr(disk_pool, "_max_workers", None)
         if max_workers is None:
-            return 2
+            return 4
         return int(max_workers)
 
     def _wrap_public_cache_methods(self, cache_manager: Any) -> None:
-        """包装 CacheManager 公开接口。"""
+        """
+        包装 CacheManager 公开接口。
 
-        self._wrap_timed_public_method(cache_manager, "request_expert")
+        输入：异步 CacheManager。
+        输出：无。
+        功能：记录批量 demand、ready 查询、等待、取权重和 release 的调用耗时及缓存命中。
+        """
+
+        self._wrap_timed_public_method(cache_manager, "request_experts")
         self._wrap_timed_public_method(cache_manager, "get_ready_expert")
 
         original_is_ready = cache_manager.is_expert_ready

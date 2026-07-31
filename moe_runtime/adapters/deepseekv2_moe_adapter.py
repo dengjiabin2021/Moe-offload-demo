@@ -16,17 +16,17 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
 # 引入 Adapter 基类。
 from .base import MoeModelAdapter
+from moe_runtime.blocks import DeepseekV2GatePrefetcher
 from moe_runtime.blocks import DeepseekV2OnDemandExperts
 from moe_runtime.blocks import asyncDeepseekV2OnDemandExperts
-from moe_runtime.blocks import patch_deepseekv2_prefetch
-from moe_runtime.prefetcher import DeepseekV2GatePrefetcher
+from moe_runtime.config import RuntimeConfig
 
 
 class DeepseekV2MoeAdapter(MoeModelAdapter):
     """DeepSeek-V2-Lite 模型适配器。
 
     该类负责 DeepSeek routed expert 权重命名、专家层识别、空模型构造，
-    以及串行/异步 experts 与 DeepSeek gate 预取 hook 的模型装配。
+    以及串行/异步 experts 与逐层 DeepSeek gate 预取模块的替换。
     """
 
     supported_model_types: list[str] = ["deepseek_v2"]
@@ -96,19 +96,20 @@ class DeepseekV2MoeAdapter(MoeModelAdapter):
         self,
         model: nn.Module,
         model_config: DeepseekV2Config,
+        runtime_config: RuntimeConfig,
         cache_manager: Any | None = None,
-        prefetcher: Any | None = None,
     ) -> nn.Module:
         """
-        替换 DeepSeek-V2 routed experts，并按配置注册未来 gate 预取 hook。
+        替换 DeepSeek-V2 routed experts。
 
-        输入：空模型、DeepSeek-V2 配置、CacheManager 和可选外部 Prefetcher。
-        输出：完成 routed experts 替换和可选预取 patch 的模型。
-        功能：保留原始 gate/shared experts，只替换 experts；普通 MLP 层不会注册预取 hook。
+        输入：空模型、DeepSeek-V2 配置、运行时配置和 CacheManager。
+        输出：完成 routed experts 替换的模型。
+        功能：只遍历真实专家层，并为需要预测未来层的异步 experts 传入层级 gate 预取模块。
         """
 
         # DeepseekV2ForCausalLM 的 decoder layers 通常位于 model.model.layers。
         layers = model.model.layers
+        routed_expert_layers = self.routed_expert_layers(model_config)
 
         # 串行/异步体系共用同一个 adapter；根据 CacheManager 暴露的接口选择专家模块。
         use_async_experts = self._use_sync_experts(cache_manager)
@@ -118,58 +119,61 @@ class DeepseekV2MoeAdapter(MoeModelAdapter):
             else DeepseekV2OnDemandExperts
         )
 
-        # 第 0 层通常是 dense MLP；只有带 experts 字段的 MoE 层需要替换。
-        for layer_idx, layer in enumerate(layers):
-            mlp = getattr(layer, "mlp", None)
-
-            if mlp is None or not hasattr(mlp, "experts"):
-                continue
-
-            # 保留 gate/shared_experts，只把 routed experts 替换为后续实现的按需加载模块。
-            mlp.experts = expert_cls(
-                model_config,
-                layer_idx=layer_idx,
-                cache_manager=cache_manager,
-                prefetcher=prefetcher,
-            )
-
-        runtime_config = getattr(cache_manager, "config", None)
-        if (
+        use_gate_prefetch = (
             use_async_experts
-            and runtime_config is not None
             and runtime_config.prefetch_policy == "gate"
-        ):
-            routed_expert_layers = self.routed_expert_layers(model_config)
-            moe_blocks = {
-                layer_idx: layers[layer_idx].mlp
-                for layer_idx in routed_expert_layers
-            }
-            gate_prefetcher = DeepseekV2GatePrefetcher(
-                cache_manager=cache_manager,
-                moe_blocks=moe_blocks,
-                routed_expert_layers=routed_expert_layers,
-                prefetch_distance=runtime_config.prefetch_distance,
-            )
+        )
+        last_routed_layer = (
+            routed_expert_layers[-1]
+            if routed_expert_layers
+            else None
+        )
 
-            # DeepSeek 第 0 层等普通 MLP 不在 routed_expert_layers 中，不会注册 hook。
-            patch_deepseekv2_prefetch(
-                model=model,
-                routed_expert_layers=routed_expert_layers,
-                prefetcher=gate_prefetcher,
-            )
+        # Adapter 只按真实专家层完成替换，前置 dense 层和最后一个 routed 层不会持有预取器。
+        for layer_idx in routed_expert_layers:
+            mlp = layers[layer_idx].mlp
+            gate_prefetcher = None
+            if use_gate_prefetch and layer_idx != last_routed_layer:
+                gate_prefetcher = DeepseekV2GatePrefetcher(
+                    cache_manager=cache_manager,
+                    model=model,
+                    layer_idx=layer_idx,
+                    routed_expert_layers=routed_expert_layers,
+                    prefetch_distance=runtime_config.prefetch_distance,
+                )
+
+            if use_async_experts:
+                mlp.experts = expert_cls(
+                    model_config,
+                    layer_idx=layer_idx,
+                    cache_manager=cache_manager,
+                    prefetcher=gate_prefetcher,
+                )
+            else:
+                mlp.experts = expert_cls(
+                    model_config,
+                    layer_idx=layer_idx,
+                    cache_manager=cache_manager,
+                )
 
         return model
 
     @staticmethod
     def _use_sync_experts(cache_manager: Any | None) -> bool:
-        """判断当前 CacheManager 是否使用异步 expert ready/release 接口。"""
+        """
+        判断当前 CacheManager 是否实现异步 expert 接口。
+
+        输入：待检查的 CacheManager。
+        输出：完整实现批量 demand、ready、等待、取权重和 release 接口时返回 True。
+        功能：Adapter 据此选择异步专家模块，避免依赖具体 CacheManager 类名。
+        """
 
         if cache_manager is None:
             return False
 
         # 不绑定具体类名，后续新的异步 CacheManager 只要实现同一组接口即可复用。
         required_methods = (
-            "request_expert",
+            "request_experts",
             "is_expert_ready",
             "wait_any_ready",
             "get_ready_expert",

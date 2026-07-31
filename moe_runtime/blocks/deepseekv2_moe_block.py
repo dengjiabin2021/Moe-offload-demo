@@ -19,8 +19,15 @@ class DeepseekV2OnDemandExperts(nn.Module):
         config: Any,
         layer_idx: int,
         cache_manager: Any | None = None,
-        prefetcher: Any | None = None,
     ) -> None:
+        """
+        初始化 DeepSeek 串行按需专家集合。
+
+        输入：模型配置、当前层号和串行 CacheManager。
+        输出：无。
+        功能：保存专家结构与缓存依赖；串行模式不创建 gate 预取模块。
+        """
+
         super().__init__()
 
         # DeepSeek-V2 配置中的 routed expert 数量。
@@ -38,9 +45,6 @@ class DeepseekV2OnDemandExperts(nn.Module):
 
         # 约定接口：get_expert(layer_idx: int, expert_idx: int) -> dict[str, Tensor]
         self.cache_manager = cache_manager
-
-        # 预取接口暂不在本模块内触发，保留给后续策略接入。
-        self.prefetcher = prefetcher
 
     def forward(
         self,

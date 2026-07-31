@@ -20,8 +20,15 @@ class Qwen2OnDemandExperts(nn.Module):
         config: Any,
         layer_idx: int,
         cache_manager: Any | None = None,
-        prefetcher: Any | None = None,
     ) -> None:
+        """
+        初始化 Qwen 串行按需专家集合。
+
+        输入：模型配置、当前层号和串行 CacheManager。
+        输出：无。
+        功能：保存专家结构与缓存依赖；串行模式不创建 gate 预取模块。
+        """
+
         super().__init__()
 
         # Qwen 配置中的 routed expert 数量。
@@ -43,10 +50,6 @@ class Qwen2OnDemandExperts(nn.Module):
         # 模型级缓存管理器，后续负责加载、命中、淘汰和显存布局。
         # 约定接口：get_expert(layer_idx: int, expert_idx: int) -> expert
         self.cache_manager = cache_manager
-
-        # 模型级预取器，后续负责根据当前或未来路由结果触发预取。
-        # 约定接口：prefetch(layer_idx: int, expert_ids: list[int]) -> None
-        self.prefetcher = prefetcher
 
     def forward(
         self,

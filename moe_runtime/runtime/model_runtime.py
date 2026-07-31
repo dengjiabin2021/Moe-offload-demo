@@ -19,7 +19,7 @@ class ModelRuntime:
     ModelRuntime 是 RuntimeEngine 内部真正执行模型装配的核心组件：
     - 它不关心具体模型结构差异，模型差异由 adapter 屏蔽。
     - 它负责构造空模型、替换 MoE 专家模块、加载常驻权重。
-    - 它持有 cache_manager 和 prefetcher，并把它们注入到 adapter 替换后的模块里。
+    - 它持有 cache_manager，并把它注入到 adapter 替换后的模块里。
     """
 
     def __init__(
@@ -30,8 +30,15 @@ class ModelRuntime:
         tensor_loader: ManifestTensorLoader,
         model_config: Any | None = None,
         cache_manager: Any | None = None,
-        prefetcher: Any | None = None,
     ) -> None:
+        """
+        初始化模型运行时依赖。
+
+        输入：运行配置、模型 Adapter、张量加载器、模型配置和 CacheManager。
+        输出：无。
+        功能：保存模型装配与常驻权重加载依赖，具体 gate 预取模块由 Adapter 按层替换。
+        """
+
         # 顶层运行时配置，包含模型目录、manifest 路径、设备策略等。
         self.runtime_config = runtime_config
 
@@ -46,9 +53,6 @@ class ModelRuntime:
 
         # 模型级缓存管理器，后续负责 routed expert 的加载、命中、淘汰和显存布局。
         self.cache_manager = cache_manager
-
-        # 模型级预取器，后续负责根据路由或策略触发专家预取。
-        self.prefetcher = prefetcher
 
         # 当前已经装配好的 transformers 模型实例。
         self.model: nn.Module | None = None
@@ -67,7 +71,12 @@ class ModelRuntime:
         self.model = self.adapter.build_empty_model(self.model_config)
 
         # 先替换 routed experts，避免后续为原始 experts 分配或加载常驻参数。
-        self.model = self.adapter.patch_moe_block(self.model, self.model_config, self.cache_manager, self.prefetcher)
+        self.model = self.adapter.patch_moe_block(
+            model=self.model,
+            model_config=self.model_config,
+            runtime_config=self.runtime_config,
+            cache_manager=self.cache_manager,
+        )
 
         # 从 manifest 中逐个加载非 routed expert 权重。
         self._load_resident_weights()

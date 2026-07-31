@@ -17,11 +17,17 @@ class MoeRuntimeEngine:
 
     设计目标：
     - 对上层用户只暴露 RuntimeEngine。
-    - 内部组合 config、模型适配器、tensor loader、cache、prefetch、expert runtime 等组件。
+    - 内部组合 config、模型适配器、tensor loader、cache 和 expert runtime 等组件。
     """
 
     def __init__(self, config: RuntimeConfig) -> None:
-        """创建 RuntimeEngine 实例。"""
+        """
+        创建 RuntimeEngine 实例。
+
+        输入：运行时配置。
+        输出：无。
+        功能：初始化尚未构建的模型、Adapter、张量加载器和 CacheManager 引用。
+        """
 
         # 顶层运行时配置，包含模型目录、manifest 路径、设备、缓存策略、预取策略等。
         self.config: RuntimeConfig = config
@@ -44,11 +50,14 @@ class MoeRuntimeEngine:
         # 缓存管理器。
         self.cache_manager: Any | None = None
 
-        # 预取器。
-        self.prefetcher: Any | None = None
-
     def build_components(self) -> None:
-        """根据 RuntimeConfig 创建内部组件。"""
+        """
+        根据 RuntimeConfig 创建内部组件。
+
+        输入：无。
+        输出：无。
+        功能：创建张量加载器、模型 Adapter、CacheManager 和 ModelRuntime。
+        """
 
         # 1. 创建 tensor loader，负责通过 tensor_name 从 safetensors 分片加载权重。
         self.tensor_loader = ManifestTensorLoader(
@@ -71,13 +80,13 @@ class MoeRuntimeEngine:
             model_config=self.model_config,
         )
 
+        # ModelRuntime 后续会把同一个运行时配置显式传给 Adapter 的模块替换入口。
         self.model_runtime = ModelRuntime(
             runtime_config=self.config,
             adapter=self.adapter,
             tensor_loader=self.tensor_loader,
             model_config=self.model_config,
             cache_manager=self.cache_manager,
-            prefetcher=self.prefetcher,
         )
 
 

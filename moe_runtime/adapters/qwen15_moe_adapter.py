@@ -20,17 +20,17 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
 # 引入 Adapter 基类和结构化返回类型。
 from .base import MoeModelAdapter
+from moe_runtime.blocks import Qwen2GatePrefetcher
 from moe_runtime.blocks import Qwen2OnDemandExperts
 from moe_runtime.blocks import asyncQwen2OnDemandExperts
-from moe_runtime.blocks import patch_qwen2_prefetch
-from moe_runtime.prefetcher import Qwen2GatePrefetcher
+from moe_runtime.config import RuntimeConfig
 
 
 class Qwen15MoeAdapter(MoeModelAdapter):
     """Qwen1.5-MoE-A2.7B 模型适配器。
 
     该类负责 Qwen routed expert 权重命名、专家层识别、空模型构造，
-    以及串行/异步 experts 与 Qwen gate 预取 hook 的模型装配。
+    以及串行/异步 experts 与逐层 Qwen gate 预取模块的替换。
     """
 
     supported_model_types: list[str] = ["qwen2_moe"]
@@ -82,28 +82,44 @@ class Qwen15MoeAdapter(MoeModelAdapter):
         return idxs_to_name
     
     def routed_expert_layers(self, model_config: Qwen2MoeConfig) -> list[int]:
-        """返回 Qwen MoE 中包含 routed experts 的 decoder layer 索引。"""
+        """
+        返回 Qwen MoE 中包含 routed experts 的 decoder layer 索引。
+
+        输入：Qwen 模型配置。
+        输出：按 decoder 顺序排列的 routed expert 层号。
+        功能：复用 Qwen 的一基 sparse step 规则，并排除显式配置为普通 MLP 的层。
+        """
+
+        if getattr(model_config, "num_experts", 0) <= 0:
+            return []
 
         sparse_step = getattr(model_config, "decoder_sparse_step", 1)
-        return list(range(0, model_config.num_hidden_layers, sparse_step))
+        mlp_only_layers = set(getattr(model_config, "mlp_only_layers", []))
+        return [
+            layer_idx
+            for layer_idx in range(model_config.num_hidden_layers)
+            if (layer_idx + 1) % sparse_step == 0
+            and layer_idx not in mlp_only_layers
+        ]
 
     def patch_moe_block(
         self,
         model: nn.Module,
         model_config: Qwen2MoeConfig,
+        runtime_config: RuntimeConfig,
         cache_manager: Any | None = None,
-        prefetcher: Any | None = None,
     ) -> nn.Module:
         """
-        替换 Qwen routed experts，并按配置注册未来 gate 预取 hook。
+        替换 Qwen routed experts。
 
-        输入：空模型、Qwen 配置、CacheManager 和可选外部 Prefetcher。
-        输出：完成 routed experts 替换和可选预取 patch 的模型。
-        功能：保留原始 gate/shared expert，只替换 experts；gate 预取仅在异步模式下启用。
+        输入：空模型、Qwen 配置、运行时配置和 CacheManager。
+        输出：完成 routed experts 替换的模型。
+        功能：只遍历真实专家层，并为需要预测未来层的异步 experts 传入层级 gate 预取模块。
         """
 
         # Qwen2MoeForCausalLM 的 decoder layers 通常位于 model.model.layers。
         layers = model.model.layers
+        routed_expert_layers = self.routed_expert_layers(model_config)
 
         # 串行/异步体系共用同一个 adapter；根据 CacheManager 暴露的接口选择专家模块。
         use_async_experts = self._use_sync_experts(cache_manager)
@@ -113,59 +129,61 @@ class Qwen15MoeAdapter(MoeModelAdapter):
             else Qwen2OnDemandExperts
         )
 
-        # 遍历每一层 decoder layer，只处理包含 sparse MoE experts 的层。
-        for layer_idx, layer in enumerate(layers):
-            mlp = getattr(layer, "mlp", None)
-
-            # 普通 dense MLP 没有 experts 字段，直接跳过。
-            if mlp is None or not hasattr(mlp, "experts"):
-                continue
-
-            # 保留 gate/shared_expert/shared_expert_gate，只把 routed experts 替换为按需加载版本。
-            mlp.experts = expert_cls(
-                model_config,
-                layer_idx=layer_idx,
-                cache_manager=cache_manager,
-                prefetcher=prefetcher,
-            )
-
-        runtime_config = getattr(cache_manager, "config", None)
-        if (
+        use_gate_prefetch = (
             use_async_experts
-            and runtime_config is not None
             and runtime_config.prefetch_policy == "gate"
-        ):
-            routed_expert_layers = self.routed_expert_layers(model_config)
-            moe_blocks = {
-                layer_idx: layers[layer_idx].mlp
-                for layer_idx in routed_expert_layers
-            }
-            gate_prefetcher = Qwen2GatePrefetcher(
-                cache_manager=cache_manager,
-                moe_blocks=moe_blocks,
-                routed_expert_layers=routed_expert_layers,
-                prefetch_distance=runtime_config.prefetch_distance,
-            )
+        )
+        last_routed_layer = (
+            routed_expert_layers[-1]
+            if routed_expert_layers
+            else None
+        )
 
-            # Hook 只旁路读取原 MoE 输入，现有异步 experts 的请求和计算逻辑保持不变。
-            patch_qwen2_prefetch(
-                model=model,
-                routed_expert_layers=routed_expert_layers,
-                prefetcher=gate_prefetcher,
-            )
+        # Adapter 只按真实专家层完成替换，普通 MLP 和最后一个 routed 层不会持有预取器。
+        for layer_idx in routed_expert_layers:
+            mlp = layers[layer_idx].mlp
+            gate_prefetcher = None
+            if use_gate_prefetch and layer_idx != last_routed_layer:
+                gate_prefetcher = Qwen2GatePrefetcher(
+                    cache_manager=cache_manager,
+                    model=model,
+                    layer_idx=layer_idx,
+                    routed_expert_layers=routed_expert_layers,
+                    prefetch_distance=runtime_config.prefetch_distance,
+                )
+
+            if use_async_experts:
+                mlp.experts = expert_cls(
+                    model_config,
+                    layer_idx=layer_idx,
+                    cache_manager=cache_manager,
+                    prefetcher=gate_prefetcher,
+                )
+            else:
+                mlp.experts = expert_cls(
+                    model_config,
+                    layer_idx=layer_idx,
+                    cache_manager=cache_manager,
+                )
 
         return model
 
     @staticmethod
     def _use_sync_experts(cache_manager: Any | None) -> bool:
-        """判断当前 CacheManager 是否使用异步 expert ready/release 接口。"""
+        """
+        判断当前 CacheManager 是否实现异步 expert 接口。
+
+        输入：待检查的 CacheManager。
+        输出：完整实现批量 demand、ready、等待、取权重和 release 接口时返回 True。
+        功能：Adapter 据此选择异步专家模块，避免依赖具体 CacheManager 类名。
+        """
 
         if cache_manager is None:
             return False
 
         # 不绑定具体类名，后续新的异步 CacheManager 只要实现同一组接口即可复用。
         required_methods = (
-            "request_expert",
+            "request_experts",
             "is_expert_ready",
             "wait_any_ready",
             "get_ready_expert",
