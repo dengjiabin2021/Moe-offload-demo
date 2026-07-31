@@ -94,7 +94,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prefetch-distance",
         type=int,
-        default=3,
+        default=1,
         help="启用 Gate 预取时向后预测的 routed expert 层数量。",
     )
     parser.add_argument(
@@ -106,7 +106,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cleanup-wait-seconds",
         type=float,
-        default=5.0,
+        default=10.0,
         help="两次运行之间完成资源回收后等待的秒数。",
     )
     parser.add_argument(
@@ -530,9 +530,9 @@ def main() -> None:
     for repetition in range(args.repeats):
         # 重复运行时交替先后顺序，减小 OS page cache 和温度变化造成的单向偏差。
         order = (
-            ("none", "gate")
+            ("gate", "none")
             if repetition % 2 == 0
-            else ("gate", "none")
+            else ("none", "gate")
         )
         for policy in order:
             print(

@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 from typing import Any
+import unicodedata
 
 import torch
 from transformers import AutoConfig, AutoTokenizer
@@ -705,6 +706,23 @@ def _display_rate(value: float | None) -> str:
     return f"{value * 100:.2f}%"
 
 
+def _right_align_terminal(value: Any, width: int) -> str:
+    """
+    按终端显示宽度右对齐文本。
+
+    输入：待显示的值和目标列宽。
+    输出：补齐左侧空格后的字符串。
+    功能：将全角和宽字符按两个终端列计算，避免中文表头与 ASCII 数值行错位。
+    """
+
+    text = str(value)
+    display_width = sum(
+        2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+        for char in text
+    )
+    return " " * max(width - display_width, 0) + text
+
+
 def print_report(report: dict[str, Any]) -> None:
     """
     在终端打印全局、逐目标层和逐来源层指标。
@@ -729,47 +747,61 @@ def print_report(report: dict[str, Any]) -> None:
     )
 
     print("\n按目标层统计：")
-    print(
-        f"{'层':>5} {'事件':>7} {'预测':>8} {'正确':>8} {'正确率':>10} "
-        f"{'任务':>8} {'完成':>8} {'完成率':>10} "
-        f"{'GPU命中/检查':>15} {'GPU率':>10} {'CPU命中/检查':>15} {'CPU率':>10}"
-    )
+    print(" ".join([
+        _right_align_terminal("层", 5),
+        _right_align_terminal("事件", 7),
+        _right_align_terminal("预测", 8),
+        _right_align_terminal("正确", 8),
+        _right_align_terminal("正确率", 10),
+        _right_align_terminal("任务", 8),
+        _right_align_terminal("完成", 8),
+        _right_align_terminal("完成率", 10),
+        _right_align_terminal("GPU命中/检查", 15),
+        _right_align_terminal("GPU率", 10),
+        _right_align_terminal("CPU命中/检查", 15),
+        _right_align_terminal("CPU率", 10),
+    ]))
     for row in report["by_target_layer"]:
         # 先构造命中计数字符串，避免表格格式化表达式掩盖实际分母。
         gpu_hit_text = f"{row['gpu_cache_hits']}/{row['cache_checks']}"
         cpu_hit_text = f"{row['cpu_cache_hits']}/{row['cache_checks']}"
-        print(
-            f"{row['target_layer']:>5} "
-            f"{row['prediction_events']:>7} "
-            f"{row['predicted_experts']:>8} "
-            f"{row['correct_experts']:>8} "
-            f"{_display_rate(row['accuracy']):>10} "
-            f"{row['submitted_tasks']:>8} "
-            f"{row['completed_tasks']:>8} "
-            f"{_display_rate(row['completion_rate']):>10} "
-            f"{gpu_hit_text:>15} "
-            f"{_display_rate(row['gpu_cache_hit_rate']):>10} "
-            f"{cpu_hit_text:>15} "
-            f"{_display_rate(row['cpu_cache_hit_rate']):>10}"
-        )
+        print(" ".join([
+            _right_align_terminal(row["target_layer"], 5),
+            _right_align_terminal(row["prediction_events"], 7),
+            _right_align_terminal(row["predicted_experts"], 8),
+            _right_align_terminal(row["correct_experts"], 8),
+            _right_align_terminal(_display_rate(row["accuracy"]), 10),
+            _right_align_terminal(row["submitted_tasks"], 8),
+            _right_align_terminal(row["completed_tasks"], 8),
+            _right_align_terminal(_display_rate(row["completion_rate"]), 10),
+            _right_align_terminal(gpu_hit_text, 15),
+            _right_align_terminal(_display_rate(row["gpu_cache_hit_rate"]), 10),
+            _right_align_terminal(cpu_hit_text, 15),
+            _right_align_terminal(_display_rate(row["cpu_cache_hit_rate"]), 10),
+        ]))
 
     print("\n按来源层 → 目标层统计正确率：")
-    print(
-        f"{'来源层':>7} {'目标层':>7} {'MoE距离':>9} {'事件':>7} "
-        f"{'预测':>8} {'正确':>8} {'正确率':>10}"
-    )
+    print(" ".join([
+        _right_align_terminal("来源层", 7),
+        _right_align_terminal("目标层", 7),
+        _right_align_terminal("MoE距离", 9),
+        _right_align_terminal("事件", 7),
+        _right_align_terminal("预测", 8),
+        _right_align_terminal("正确", 8),
+        _right_align_terminal("正确率", 10),
+    ]))
     for row in report["accuracy_by_source_layer"]:
         distance = row["routed_layer_distance"]
         distance_text = "N/A" if distance is None else str(distance)
-        print(
-            f"{row['source_layer']:>7} "
-            f"{row['target_layer']:>7} "
-            f"{distance_text:>9} "
-            f"{row['events']:>7} "
-            f"{row['predicted_experts']:>8} "
-            f"{row['correct_experts']:>8} "
-            f"{_display_rate(row['accuracy']):>10}"
-        )
+        print(" ".join([
+            _right_align_terminal(row["source_layer"], 7),
+            _right_align_terminal(row["target_layer"], 7),
+            _right_align_terminal(distance_text, 9),
+            _right_align_terminal(row["events"], 7),
+            _right_align_terminal(row["predicted_experts"], 8),
+            _right_align_terminal(row["correct_experts"], 8),
+            _right_align_terminal(_display_rate(row["accuracy"]), 10),
+        ]))
 
     if report["unsettled_predictions"]:
         print("\n警告：仍有未到达目标层的预测，详见 JSON 的 unsettled_predictions。")

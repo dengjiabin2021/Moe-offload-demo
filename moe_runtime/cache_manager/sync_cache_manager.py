@@ -559,12 +559,12 @@ class asyncExpertCacheManager:
         return progressed
 
     def _complete_finished_h2d_locked(self) -> bool:
-        """检查 CPU -> GPU 拷贝是否完成。
+        """
+        检查 CPU 到 GPU 的拷贝是否完成。
 
-        状态流转：
-        - GPU: loading -> protected
-        - CPU: protected -> used
-        loading_gpu 中的 request 必须同时持有源 CPU slot 和目标 GPU slot。
+        输入：无；调用方必须已经持有 self._cv。
+        输出：至少一个 H2D 任务完成时返回 True。
+        功能：将 GPU slot 从 loading 转为 protected，将 CPU slot 从 protected 转为 used，并解除 request 对 CPU slot 的所有权。
         """
 
         progressed = False
@@ -615,6 +615,10 @@ class asyncExpertCacheManager:
             # CPU 源 slot 不再被 H2D 使用，可以重新变为 used，后续允许 LRU 覆盖。
             cpu_slot.status = "used"
             cpu_slot.last_used_step = self._global_step
+
+            # request 已经只依赖 GPU slot，必须解除 CPU slot 所有权，避免 CPU 缓存复用时被误判为仍在使用。
+            req.cpu_slot_idx = None
+            req.cpu_generation = None
 
             progressed = True
 
@@ -1189,10 +1193,23 @@ class asyncExpertCacheManager:
         if slots is self._cpu_slots and slot.layer_idx is not None and slot.expert_idx is not None:
             key = (slot.layer_idx, slot.expert_idx)
             req = self._requests.get(key)
-            if req is not None:
-                if not req.is_prefetch or req.stage != "prefetch_ready_cpu":
-                    raise RuntimeError(f"Used CPU slot has an active non-prefetch request: {key}")
+            if req is None:
+                return
+
+            # prefetch_ready_cpu request 仍以该 CPU slot 保存预取结果，淘汰时必须同步删除 request。
+            if req.is_prefetch:
+                if (
+                    req.stage != "prefetch_ready_cpu"
+                    or req.cpu_slot_idx != slot_idx
+                    or req.cpu_generation != slot.generation
+                ):
+                    raise RuntimeError(f"Used CPU slot has an invalid prefetch request: {key}")
                 self._requests.pop(key, None)
+                return
+
+            # demand 只有在仍记录当前 CPU slot 时才持有它；ready/compute_pending 已在 H2D 完成后解除所有权。
+            if req.cpu_slot_idx == slot_idx:
+                raise RuntimeError(f"Used CPU slot is still owned by an active demand request: {key}")
 
     @staticmethod
     def _free_slot_locked(slot: _SlotInfo) -> None:
