@@ -6,6 +6,19 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+# demand 使用独立磁盘 worker，避免已经排队的预取阻塞当前层真实专家。
+_DEMAND_DISK_WORKERS = 4
+
+# 预取只占用少量独立 worker，防止低优先级读取耗尽磁盘并发。
+_PREFETCH_DISK_WORKERS = 2
+
+# 后台调度线程没有可推进任务时的短等待时间，单位秒。
+_SCHEDULER_WAIT_SECONDS = 0.0005
+
+# block 阻塞等待任意 expert ready 时的轮询等待时间，单位秒。
+_WAIT_READY_SECONDS = 0.001
+
+
 @dataclass
 class RuntimeConfig:
     """MoE Runtime 的顶层配置。
@@ -42,6 +55,9 @@ class RuntimeConfig:
 
     # Gate 预取向后预测的 MoE 层数量；普通 MLP 层不计入距离。
     prefetch_distance: int = 1
+
+    # 是否为 expert CPU cache 使用 pinned memory；仅在 routed expert 目标设备为可用 CUDA 时生效。
+    pin_memory: bool = False
 
     # CPU 缓存容量上限
     max_cpu_cache_capacity: dict[int, int] = None

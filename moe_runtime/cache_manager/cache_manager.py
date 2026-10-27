@@ -92,7 +92,7 @@ class ExpertCacheManager:
                 self._expert_elems,
                 dtype=self._expert_dtype,
                 device=self._cpu_device,
-                #pin_memory=self._is_cuda_target
+                pin_memory=self.config.pin_memory and self._is_cuda_target,
             )
 
         if self._num_gpu_experts > 0:

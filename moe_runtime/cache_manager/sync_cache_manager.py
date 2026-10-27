@@ -9,24 +9,17 @@ from typing import Any
 
 import torch
 
-from moe_runtime.config import RuntimeConfig
+from moe_runtime.config import (
+    _DEMAND_DISK_WORKERS,
+    _PREFETCH_DISK_WORKERS,
+    _SCHEDULER_WAIT_SECONDS,
+    _WAIT_READY_SECONDS,
+)
 from moe_runtime.loader import ManifestTensorLoader
 
 
 # CacheManager 内部统一用 (layer_idx, expert_idx) 作为一个 expert 的唯一键。
 ExpertKey = tuple[int, int]
-
-# demand 使用独立磁盘 worker，避免已经排队的预取阻塞当前层真实专家。
-_DEMAND_DISK_WORKERS = 4
-
-# 预取只占用少量独立 worker，防止低优先级读取耗尽磁盘并发。
-_PREFETCH_DISK_WORKERS = 2
-
-# 后台调度线程没有可推进任务时的短等待时间，单位秒。
-_SCHEDULER_WAIT_SECONDS = 0.0005
-
-# block 阻塞等待任意 expert ready 时的轮询等待时间，单位秒。
-_WAIT_READY_SECONDS = 0.001
 
 
 @dataclass
@@ -179,13 +172,13 @@ class asyncExpertCacheManager:
         self._num_cpu_experts, self._cpu_layer_slot_map = self._build_layer_slot_mapping(self._cpu_cache_capacity)
         self._num_gpu_experts, self._gpu_layer_slot_map = self._build_layer_slot_mapping(self._gpu_cache_capacity)
 
-        # CPU buffer 使用 pinned memory，可以让 CUDA H2D copy_ 真正异步。
+        # 配置启用且目标为 CUDA 时使用 pinned memory，使 non_blocking H2D 能够真正异步提交。
         self._cpu_buffer = torch.empty(
             self._num_cpu_experts,
             self._expert_elems,
             dtype=self._expert_dtype,
             device=self._cpu_device,
-            #pin_memory=self._is_cuda_target
+            pin_memory=self.config.pin_memory and self._is_cuda_target,
         )
 
         # GPU buffer 是 block 计算时直接读取的专家权重池。
